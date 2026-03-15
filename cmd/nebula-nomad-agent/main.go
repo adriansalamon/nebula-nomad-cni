@@ -36,13 +36,14 @@ func main() {
 
 	// Create agent config from loaded config
 	agentConfig := &agent.Config{
-		SocketPath:   cfg.SocketPath,
-		ConsulAddr:   cfg.ConsulAddr,
-		NomadAddr:    cfg.NomadAddr,
-		CACertPath:   cfg.CACertPath,
-		CAKeyPath:    cfg.CAKeyPath,
-		NebulaConfig: cfg.NebulaConfigPath,
-		CertTTL:      cfg.CertTTL,
+		SocketPath:       cfg.SocketPath,
+		ConsulAddr:       cfg.ConsulAddr,
+		NomadAddr:        cfg.NomadAddr,
+		CACertPath:       cfg.CACertPath,
+		CAKeyPath:        cfg.CAKeyPath,
+		NebulaConfig:     cfg.NebulaConfigPath,
+		WorkerBinaryPath: cfg.WorkerBinaryPath,
+		CertTTL:          cfg.CertTTL,
 	}
 
 	// Create agent

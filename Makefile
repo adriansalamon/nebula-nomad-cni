@@ -8,7 +8,7 @@ BUILD_DIR := build
 
 all: build
 
-build: build-agent build-cni
+build: build-agent build-cni build-worker
 
 build-agent:
 	@echo "Building nebula-nomad-agent..."
@@ -19,6 +19,11 @@ build-cni:
 	@echo "Building nebula-nomad-cni..."
 	@mkdir -p $(BUILD_DIR)
 	go build  -o $(BUILD_DIR)/nebula-nomad-cni ./cmd/nebula-nomad-cni
+
+build-worker:
+	@echo "Building nebula-nomad-worker..."
+	@mkdir -p $(BUILD_DIR)
+	go build  -o $(BUILD_DIR)/nebula-nomad-worker ./cmd/nebula-nomad-worker
 
 clean:
 	@echo "Cleaning build artifacts..."

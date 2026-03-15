@@ -53,12 +53,13 @@
               inherit version;
               src = ./.;
 
-              vendorHash = "sha256-arE22XxWwmkzFx0+C5j2y0+qJfet038XFy4efic/zXc=";
+              vendorHash = "sha256-/RFNDfoU59iwtRCMp+yrBwhjpMY+rEL+h/68ggrqiB4=";
 
               # Build both binaries
               subPackages = [
                 "cmd/nebula-nomad-cni"
                 "cmd/nebula-nomad-agent"
+                "cmd/nebula-nomad-worker"
               ];
 
               ldflags = [

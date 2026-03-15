@@ -15,6 +15,7 @@ type Config struct {
 	CACertPath       string        `toml:"ca_cert_path"`
 	CAKeyPath        string        `toml:"ca_key_path"`
 	NebulaConfigPath string        `toml:"nebula_config_path"`
+	WorkerBinaryPath string        `toml:"worker_binary_path"`
 	CertTTL          time.Duration `toml:"cert_ttl"`
 	IPPool           IPPoolConfig  `toml:"ip_pool"`
 }
@@ -35,6 +36,7 @@ func DefaultConfig() *Config {
 		CACertPath:       "/etc/nebula-cni/ca.crt",
 		CAKeyPath:        "/etc/nebula-cni/ca.key",
 		NebulaConfigPath: "/etc/nebula-cni/nebula-config.yaml",
+		WorkerBinaryPath: "/usr/local/bin/nebula-nomad-worker",
 		CertTTL:          1 * time.Hour,
 	}
 }

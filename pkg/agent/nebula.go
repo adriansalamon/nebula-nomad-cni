@@ -5,41 +5,39 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"runtime"
 	"sync"
 
-	"github.com/sirupsen/logrus"
-	"github.com/slackhq/nebula"
+	"github.com/adriansalamon/nebula-nomad-cni/pkg/worker"
+	"github.com/coreos/go-systemd/v22/dbus"
+	godbus "github.com/godbus/dbus/v5"
 	"github.com/slackhq/nebula/cert"
-	"github.com/slackhq/nebula/config"
-	"github.com/vishvananda/netns"
 )
 
-// NebulaManager manages Nebula instances.
+// NebulaManager manages Nebula worker processes via systemd.
 type NebulaManager struct {
-	nebulaConfig  string
-	instances     map[string]*NebulaInstance
-	instancesLock sync.RWMutex
+	nebulaConfig     string
+	workerBinaryPath string
+	instances        map[string]*NebulaInstance
+	instancesLock    sync.RWMutex
+	systemdConn      *dbus.Conn
 }
 
-// NebulaInstance represents a running Nebula instance.
+// NebulaInstance represents a running Nebula worker process.
 type NebulaInstance struct {
-	AllocID string
-	control *nebula.Control
-	cancel  context.CancelFunc
-	logger  *logrus.Logger
-	config  *config.C // Nebula config object (has Get methods to read config)
+	AllocID  string
+	UnitName string // systemd unit name
 }
 
 // NewNebulaManager creates a new Nebula instance manager.
-func NewNebulaManager(nebulaConfig string) *NebulaManager {
+func NewNebulaManager(nebulaConfig, workerBinaryPath string) *NebulaManager {
 	return &NebulaManager{
-		nebulaConfig: nebulaConfig,
-		instances:    make(map[string]*NebulaInstance),
+		nebulaConfig:     nebulaConfig,
+		workerBinaryPath: workerBinaryPath,
+		instances:        make(map[string]*NebulaInstance),
 	}
 }
 
-// StartInstance starts a Nebula instance for the given allocation.
+// StartInstance starts a Nebula worker process for the given allocation using systemd.
 func (nm *NebulaManager) StartInstance(allocID, ip, certPEM, keyPEM, caCertPEM, jobConfig, netns string) error {
 	nm.instancesLock.Lock()
 	defer nm.instancesLock.Unlock()
@@ -55,37 +53,45 @@ func (nm *NebulaManager) StartInstance(allocID, ip, certPEM, keyPEM, caCertPEM, 
 		return fmt.Errorf("failed to generate instance config: %w", err)
 	}
 
-	// Create logger for this instance
-	// Logs go to stdout (captured by systemd/journald) with allocation ID prefix
-	logger := logrus.New()
-	logger.SetLevel(logrus.InfoLevel)
-	logger.SetFormatter(&logrus.TextFormatter{
-		FullTimestamp: true,
-	})
-
-	// Add allocation ID to all log entries
-	logger = logger.WithField("alloc_id", allocID).Logger
-
-	// Write to stdout so systemd captures it
-	logger.SetOutput(os.Stdout)
-
-	// Start Nebula in the network namespace
-	ctx, cancel := context.WithCancel(context.Background())
-
-	// Start the Nebula instance with config string
-	control, nebulaConfig, err := nm.startNebulaInNamespace(ctx, netns, configString, logger)
+	// Get systemd connection
+	conn, err := nm.getSystemdConnection()
 	if err != nil {
-		cancel()
-		return fmt.Errorf("failed to start Nebula in namespace: %w", err)
+		return fmt.Errorf("failed to connect to systemd: %w", err)
 	}
+
+	// Create transient unit with network namespace
+	unitName := worker.GetUnitName(allocID)
+	socketPath := worker.GetSocketPath(allocID)
+
+	// Stop any existing unit with this namespace
+	if err := nm.stopExistingUnit(conn, unitName); err != nil {
+		log.Printf("Warning: failed to stop existing unit %s: %v", unitName, err)
+		// Continue anyway - we'll try to create the unit
+	}
+
+	properties := []dbus.Property{
+		dbus.PropExecStart([]string{nm.workerBinaryPath}, false),
+		dbusProperty("NetworkNamespacePath", netns),
+		dbusProperty("Environment", []string{
+			"ALLOC_ID=" + allocID,
+			"NEBULA_SOCKET=" + socketPath,
+			"NEBULA_CONFIG=" + configString,
+		}),
+		dbusProperty("Restart", "on-failure"),
+	}
+
+	// Start unit
+	_, err = conn.StartTransientUnitContext(context.TODO(), unitName, "replace", properties, nil)
+	if err != nil {
+		return fmt.Errorf("failed to start systemd unit: %w", err)
+	}
+
+	log.Printf("Started systemd unit %s for allocation %s", unitName, allocID)
 
 	// Create instance record
 	instance := &NebulaInstance{
-		AllocID: allocID,
-		control: control,
-		cancel:  cancel,
-		logger:  logger,
-		config:  nebulaConfig,
+		AllocID:  allocID,
+		UnitName: unitName,
 	}
 
 	nm.instances[allocID] = instance
@@ -93,80 +99,57 @@ func (nm *NebulaManager) StartInstance(allocID, ip, certPEM, keyPEM, caCertPEM, 
 	return nil
 }
 
-// startNebulaInNamespace starts a Nebula instance in the specified network namespace.
-func (nm *NebulaManager) startNebulaInNamespace(ctx context.Context, netnsPath, configString string, logger *logrus.Logger) (*nebula.Control, *config.C, error) {
-	// Open the network namespace file
-	nsHandle, err := netns.GetFromPath(netnsPath)
+// getSystemdConnection gets or creates a systemd D-Bus connection.
+func (nm *NebulaManager) getSystemdConnection() (*dbus.Conn, error) {
+	if nm.systemdConn != nil {
+		return nm.systemdConn, nil
+	}
+
+	conn, err := dbus.NewSystemdConnectionContext(context.TODO())
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to open network namespace %s: %w", netnsPath, err)
-	}
-	defer nsHandle.Close()
-
-	// Channel to return result from goroutine
-	type result struct {
-		control *nebula.Control
-		config  *config.C
-		err     error
-	}
-	resultCh := make(chan result, 1)
-
-	// Start Nebula in a goroutine within the target network namespace
-	go func() {
-		// Lock goroutine to OS thread to maintain namespace affinity
-		runtime.LockOSThread()
-		defer runtime.UnlockOSThread()
-
-		// Save current namespace to restore later
-		origNs, err := netns.Get()
-		if err != nil {
-			resultCh <- result{err: fmt.Errorf("failed to get current namespace: %w", err)}
-			return
-		}
-		defer origNs.Close()
-
-		// Switch to target namespace
-		if err := netns.Set(nsHandle); err != nil {
-			resultCh <- result{err: fmt.Errorf("failed to set network namespace: %w", err)}
-			return
-		}
-		defer netns.Set(origNs)
-
-		// Load Nebula config from string
-		c := config.NewC(logger)
-		if err := c.LoadString(configString); err != nil {
-			resultCh <- result{err: fmt.Errorf("failed to load config: %w", err)}
-			return
-		}
-
-		// Initialize Nebula (creates tun device in current namespace)
-		control, err := nebula.Main(c, false, "nebula-nomad", logger, nil)
-		if err != nil {
-			resultCh <- result{err: fmt.Errorf("failed to start Nebula: %w", err)}
-			return
-		}
-
-		if control == nil {
-			resultCh <- result{err: fmt.Errorf("nebula.Main returned nil control")}
-			return
-		}
-
-		// Start Nebula's background workers
-		control.Start()
-
-		// Signal that Nebula has started successfully
-		resultCh <- result{control: control, config: c}
-	}()
-
-	// Wait for Nebula to start
-	res := <-resultCh
-	if res.err != nil {
-		return nil, nil, res.err
+		return nil, fmt.Errorf("failed to connect to systemd: %w", err)
 	}
 
-	return res.control, res.config, nil
+	nm.systemdConn = conn
+	return conn, nil
 }
 
-// StopInstance stops a Nebula instance for the given allocation.
+// stopExistingUnit stops an existing systemd unit if it exists.
+func (nm *NebulaManager) stopExistingUnit(conn *dbus.Conn, unitName string) error {
+	// Check if unit exists by trying to get its properties
+	units, err := conn.ListUnitsByNamesContext(context.TODO(), []string{unitName})
+	if err != nil {
+		return fmt.Errorf("failed to check unit status: %w", err)
+	}
+
+	if len(units) == 0 {
+		return nil // Unit doesn't exist, nothing to stop
+	}
+
+	unit := units[0]
+
+	if unit.LoadState == "not-found" {
+		return nil // Unit doesn't exist
+	}
+
+	// Stop the unit if it's active
+	if unit.ActiveState == "active" || unit.ActiveState == "activating" {
+		log.Printf("Stopping existing unit %s (state: %s)", unitName, unit.ActiveState)
+		_, err := conn.StopUnitContext(context.TODO(), unitName, "replace", nil)
+		if err != nil {
+			return fmt.Errorf("failed to stop unit: %w", err)
+		}
+	}
+
+	// Reset any failed state
+	if err := conn.ResetFailedUnitContext(context.TODO(), unitName); err != nil {
+		log.Printf("Warning: failed to reset unit state: %v", err)
+	}
+
+	return nil
+}
+
+// StopInstance stops a Nebula worker process for the given allocation.
 func (nm *NebulaManager) StopInstance(allocID string) error {
 	nm.instancesLock.Lock()
 	defer nm.instancesLock.Unlock()
@@ -176,16 +159,25 @@ func (nm *NebulaManager) StopInstance(allocID string) error {
 		return nil // Instance doesn't exist, nothing to do
 	}
 
-	// Stop the Nebula control (this will unblock ShutdownBlock())
-	if instance.control != nil {
-		instance.control.Stop()
+	// Get systemd connection
+	conn, err := nm.getSystemdConnection()
+	if err != nil {
+		return fmt.Errorf("failed to connect to systemd: %w", err)
 	}
 
-	// Cancel the context for cleanup
-	instance.cancel()
+	// Stop the systemd unit
+	_, err = conn.StopUnitContext(context.TODO(), instance.UnitName, "replace", nil)
+	if err != nil {
+		log.Printf("Warning: failed to stop systemd unit %s: %v", instance.UnitName, err)
+		// Continue with cleanup even if stop fails
+	}
 
-	// Remove from instances map
+	// Clean up socket file
+	socketPath := worker.GetSocketPath(allocID)
+	_ = os.RemoveAll(socketPath)
+
 	delete(nm.instances, allocID)
+	log.Printf("Stopped Nebula worker for allocation %s", allocID)
 
 	return nil
 }
@@ -199,7 +191,7 @@ func (nm *NebulaManager) GetInstance(allocID string) (*NebulaInstance, bool) {
 	return instance, exists
 }
 
-// StopAll stops all running Nebula instances (called on agent shutdown).
+// StopAll stops all running Nebula worker processes (called on agent shutdown).
 func (nm *NebulaManager) StopAll() {
 	nm.instancesLock.Lock()
 	defer nm.instancesLock.Unlock()
@@ -217,11 +209,17 @@ func (nm *NebulaManager) StopAll() {
 		nm.instancesLock.Lock()
 	}
 
+	// Close systemd connection
+	if nm.systemdConn != nil {
+		nm.systemdConn.Close()
+		nm.systemdConn = nil
+	}
+
 	log.Printf("All Nebula instances stopped")
 }
 
 // generateInstanceConfigString generates a Nebula config string with inline certs.
-// This combines the base cluster config with job-specific overrides.
+// This combines the base config with job-specific overrides.
 func (nm *NebulaManager) generateInstanceConfigString(certPEM, keyPEM, caCertPEM, jobConfig, ip string) (string, error) {
 	// Start with base config if provided
 	configMap := map[string]any{}
@@ -272,43 +270,68 @@ func (nm *NebulaManager) generateInstanceConfigString(certPEM, keyPEM, caCertPEM
 	return finalConfig, nil
 }
 
+func dbusProperty(name string, v any) dbus.Property {
+	return dbus.Property{
+		Name:  name,
+		Value: godbus.MakeVariant(v),
+	}
+}
+
 // GenerateConfigString is a public wrapper for generateInstanceConfigString.
 func (nm *NebulaManager) GenerateConfigString(certPEM, keyPEM, caCertPEM, jobConfig, ip string) (string, error) {
 	return nm.generateInstanceConfigString(certPEM, keyPEM, caCertPEM, jobConfig, ip)
 }
 
-// ReloadConfig reloads the config for a running Nebula instance using ReloadConfigString.
+// ReloadConfig reloads the config for a running Nebula worker via socket RPC.
 func (nm *NebulaManager) ReloadConfig(allocID, newConfigString string) error {
 	nm.instancesLock.RLock()
 	defer nm.instancesLock.RUnlock()
 
-	instance, exists := nm.instances[allocID]
+	_, exists := nm.instances[allocID]
 	if !exists {
 		return fmt.Errorf("instance not found")
 	}
 
-	// Use Nebula's ReloadConfigString to reload config without restarting
-	if err := instance.config.ReloadConfigString(newConfigString); err != nil {
-		return fmt.Errorf("failed to reload config string: %w", err)
+	// Send reload command to worker via socket
+	socketPath := worker.GetSocketPath(allocID)
+	client := worker.NewClient(socketPath)
+
+	if err := client.Reload(newConfigString); err != nil {
+		return fmt.Errorf("failed to reload config via RPC: %w", err)
 	}
 
 	log.Printf("Successfully reloaded config for allocation %s", allocID)
 	return nil
 }
 
-// GetCertFromConfig reads the certificate from an allocation's running config.
+// GetCertFromConfig reads the certificate from a worker's current config via RPC.
 func (nm *NebulaManager) GetCertFromConfig(allocID string) (cert.Certificate, error) {
 	nm.instancesLock.RLock()
 	defer nm.instancesLock.RUnlock()
 
-	instance, exists := nm.instances[allocID]
+	_, exists := nm.instances[allocID]
 	if !exists {
 		return nil, fmt.Errorf("instance not found")
 	}
 
-	// Get pki.cert from config using config.Get
-	pkiInterface := instance.config.Get("pki")
-	if pkiInterface == nil {
+	// Get config from worker via socket
+	socketPath := worker.GetSocketPath(allocID)
+	client := worker.NewClient(socketPath)
+
+	configYAML, err := client.GetConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get config from worker: %w", err)
+	}
+
+	// Parse YAML config to extract cert
+	configMap, err := parseYAML(configYAML)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse config YAML: %w", err)
+	}
+
+	// Get pki.cert from config
+	pkiInterface, ok := configMap["pki"]
+	if !ok {
 		return nil, fmt.Errorf("no pki section in config")
 	}
 

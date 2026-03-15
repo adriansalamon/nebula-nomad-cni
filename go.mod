@@ -6,12 +6,14 @@ require (
 	dario.cat/mergo v1.0.2
 	github.com/BurntSushi/toml v1.6.0
 	github.com/containernetworking/cni v1.3.0
+	github.com/coreos/go-systemd/v22 v22.7.0
+	github.com/godbus/dbus/v5 v5.1.0
 	github.com/gorilla/mux v1.8.1
 	github.com/hashicorp/consul/api v1.33.4
 	github.com/hashicorp/nomad/api v0.0.0-20260312153230-b4cbc3732304
 	github.com/sirupsen/logrus v1.9.4
 	github.com/slackhq/nebula v1.10.3
-	github.com/vishvananda/netns v0.0.5
+	go.yaml.in/yaml/v2 v2.4.2
 	golang.org/x/crypto v0.47.0
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -54,7 +56,7 @@ require (
 	github.com/rcrowley/go-metrics v0.0.0-20201227073835-cf1acfcdf475 // indirect
 	github.com/stefanberger/go-pkcs11uri v0.0.0-20230803200340-78284954bff6 // indirect
 	github.com/vishvananda/netlink v1.3.1 // indirect
-	go.yaml.in/yaml/v2 v2.4.2 // indirect
+	github.com/vishvananda/netns v0.0.5 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	golang.org/x/exp v0.0.0-20250808145144-a408d31f581a // indirect
 	golang.org/x/mod v0.31.0 // indirect

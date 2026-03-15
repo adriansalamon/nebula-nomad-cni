@@ -15,13 +15,14 @@ import (
 
 // Config holds the configuration for the agent.
 type Config struct {
-	SocketPath   string
-	ConsulAddr   string
-	NomadAddr    string
-	CACertPath   string
-	CAKeyPath    string
-	NebulaConfig string
-	CertTTL      time.Duration
+	SocketPath       string
+	ConsulAddr       string
+	NomadAddr        string
+	CACertPath       string
+	CAKeyPath        string
+	NebulaConfig     string
+	WorkerBinaryPath string
+	CertTTL          time.Duration
 }
 
 // Agent is the main agent service that handles IP allocation and certificate signing.
@@ -53,7 +54,7 @@ func NewAgent(config *Config) (*Agent, error) {
 		return nil, fmt.Errorf("failed to create certificate signer: %w", err)
 	}
 
-	nebulaManager := NewNebulaManager(config.NebulaConfig)
+	nebulaManager := NewNebulaManager(config.NebulaConfig, config.WorkerBinaryPath)
 
 	return &Agent{
 		config:        config,
