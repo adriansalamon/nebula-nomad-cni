@@ -5,6 +5,8 @@ build/
 *.dll
 *.so
 *.dylib
+mnt/
+result
 
 # Test binaries
 *.test
