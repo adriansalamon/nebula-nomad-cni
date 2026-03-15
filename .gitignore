@@ -1,0 +1,36 @@
+# Binaries
+build/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries
+*.test
+*.out
+
+# Go workspace file
+go.work
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+
+# Logs
+*.log
+
+# Certificates (do not commit!)
+*.crt
+*.key
+*.pem
+
+# Local development
+/tmp/
+/test-data/
