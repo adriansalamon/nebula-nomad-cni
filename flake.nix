@@ -34,9 +34,12 @@
           ...
         }:
         let
-          # Use git describe for version, fall back to rev or dirty
-          version = if (self ? rev) then self.shortRev else "dirty";
-          # Full commit hash
+          # TODO: get this some better way, for now just hard code
+          baseVersion = "0.1.0";
+
+          # Version format: vx.x.x-sha
+          gitShortRev = if (self ? rev) then self.shortRev else "dirty";
+          version = "${baseVersion}-${gitShortRev}";
           gitCommit = if (self ? rev) then self.rev else "unknown";
         in
         {
