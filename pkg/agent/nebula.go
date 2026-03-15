@@ -224,7 +224,10 @@ func (nm *NebulaManager) StopAll() {
 // This combines the base cluster config with job-specific overrides.
 func (nm *NebulaManager) generateInstanceConfigString(certPEM, keyPEM, caCertPEM, jobConfig, ip string) (string, error) {
 	// Start with base config if provided
-	baseConfigMap := map[string]interface{}{}
+	configMap := map[string]any{}
+	configMap["pki"] = map[string]any{
+		"ca": caCertPEM,
+	}
 
 	if nm.nebulaConfig != "" {
 		baseConfigData, err := os.ReadFile(nm.nebulaConfig)
@@ -237,7 +240,7 @@ func (nm *NebulaManager) generateInstanceConfigString(certPEM, keyPEM, caCertPEM
 			return "", fmt.Errorf("failed to parse base config: %w", err)
 		}
 
-		baseConfigMap = userConfigMap
+		configMap = mergeConfigs(configMap, userConfigMap)
 	}
 
 	// Parse job-specific config if provided
@@ -248,18 +251,20 @@ func (nm *NebulaManager) generateInstanceConfigString(certPEM, keyPEM, caCertPEM
 		}
 
 		// Merge job config into base config (highest priority)
-		baseConfigMap = mergeConfigs(baseConfigMap, jobConfigMap)
+		configMap = mergeConfigs(configMap, jobConfigMap)
 	}
+
+	pkiMap := map[string]any{
+		"pki": map[string]any{
+			"cert": certPEM,
+			"key":  keyPEM,
+		}}
 
 	// Inline the PKI certs (this overrides any pki config)
-	baseConfigMap["pki"] = map[string]interface{}{
-		"ca":   caCertPEM,
-		"cert": certPEM,
-		"key":  keyPEM,
-	}
+	configMap = mergeConfigs(configMap, pkiMap)
 
 	// Convert to YAML string
-	finalConfig, err := toYAML(baseConfigMap)
+	finalConfig, err := toYAML(configMap)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal final config: %w", err)
 	}
