@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/containernetworking/cni/pkg/invoke"
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
 	current "github.com/containernetworking/cni/pkg/types/100"
@@ -19,15 +20,25 @@ import (
 	"github.com/adriansalamon/nebula-nomad-cni/pkg/client"
 )
 
+// MacVLANConfig holds optional macvlan delegation configuration
+type MacVLANConfig struct {
+	Enable bool           `json:"enable"`
+	Master string         `json:"master"`
+	Name   string         `json:"name"`
+	IPAM   map[string]any `json:"ipam"`
+}
+
 // NetConf is the CNI network configuration.
 type NetConf struct {
 	types.NetConf
 
 	// SocketPath is the path to the agent's unix socket
 	SocketPath string `json:"socket_path"`
-
 	// RolesMetaKey is the Nomad task metadata key containing roles
 	RolesMetaKey string `json:"roles_meta_key"`
+
+	// MacVLAN holds optional macvlan delegation configuration
+	MacVLAN *MacVLANConfig `json:"macvlan,omitempty"`
 
 	// PrevResult is the result from the previous plugin in the chain
 	PrevResult *current.Result `json:"-"`
@@ -133,8 +144,99 @@ func cmdAdd(args *skel.CmdArgs) error {
 		}
 	}
 
+	// Delegate to macvlan plugin if configured
+	if conf.MacVLAN != nil && conf.MacVLAN.Enable {
+		log.Printf("Delegating to macvlan plugin: master=%s name=%s", conf.MacVLAN.Master, conf.MacVLAN.Name)
+
+		macvlanResult, err := delegateMacvlan(args, conf)
+		if err != nil {
+			return fmt.Errorf("failed to delegate to macvlan: %w", err)
+		}
+
+		// Merge macvlan result with our result
+		result.Interfaces = append(result.Interfaces, macvlanResult.Interfaces...)
+		result.IPs = append(result.IPs, macvlanResult.IPs...)
+		result.Routes = append(result.Routes, macvlanResult.Routes...)
+
+		log.Printf("Successfully delegated to macvlan, added %d interfaces, %d IPs, %d routes",
+			len(macvlanResult.Interfaces), len(macvlanResult.IPs), len(macvlanResult.Routes))
+	}
+
 	// Return combined result
 	return types.PrintResult(result, conf.CNIVersion)
+}
+
+// delegateMacvlan delegates to the macvlan CNI plugin with DHCP IPAM
+func delegateMacvlan(args *skel.CmdArgs, conf *NetConf) (*current.Result, error) {
+	if os.Setenv("CNI_IFNAME", conf.MacVLAN.Name) != nil {
+		return nil, fmt.Errorf("failed to set CNI_IFNAME")
+	}
+
+	// Build macvlan plugin configuration
+	macvlanConf := map[string]interface{}{
+		"cniVersion": conf.CNIVersion,
+		"type":       "macvlan",
+		"name":       conf.MacVLAN.Name,
+		"master":     conf.MacVLAN.Master,
+		"ipam":       conf.MacVLAN.IPAM,
+	}
+
+	// Marshal to JSON
+	macvlanConfBytes, err := json.Marshal(macvlanConf)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal macvlan config: %w", err)
+	}
+
+	origIfName := args.IfName
+	args.IfName = conf.MacVLAN.Name
+
+	result, err := invoke.DelegateAdd(context.TODO(), "macvlan", macvlanConfBytes, nil)
+	args.IfName = origIfName
+
+	if err != nil {
+		return nil, fmt.Errorf("macvlan plugin failed: %w", err)
+	}
+
+	// Convert to current version
+	currentResult, err := current.NewResultFromResult(result)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert macvlan result: %w", err)
+	}
+
+	return currentResult, nil
+}
+
+// delegateMacvlanDel delegates cleanup to the macvlan CNI plugin
+func delegateMacvlanDel(args *skel.CmdArgs, conf *NetConf) error {
+	if os.Setenv("CNI_IFNAME", conf.MacVLAN.Name) != nil {
+		return fmt.Errorf("failed to set CNI_IFNAME")
+	}
+	// Build macvlan plugin configuration (same as ADD)
+	macvlanConf := map[string]interface{}{
+		"cniVersion": conf.CNIVersion,
+		"type":       "macvlan",
+		"name":       conf.MacVLAN.Name,
+		"master":     conf.MacVLAN.Master,
+		"ipam":       conf.MacVLAN.IPAM,
+	}
+
+	// Marshal to JSON
+	macvlanConfBytes, err := json.Marshal(macvlanConf)
+	if err != nil {
+		return fmt.Errorf("failed to marshal macvlan config: %w", err)
+	}
+
+	origIfName := args.IfName
+	args.IfName = conf.MacVLAN.Name
+
+	err = invoke.DelegateDel(context.Background(), "macvlan", macvlanConfBytes, nil)
+	args.IfName = origIfName
+
+	if err != nil {
+		return fmt.Errorf("macvlan plugin cleanup failed: %w", err)
+	}
+
+	return nil
 }
 
 // cmdDel is called when a container is deleted.
@@ -189,6 +291,19 @@ func cmdDel(args *skel.CmdArgs) error {
 	}
 
 	log.Printf("Successfully deallocated allocation %s", allocID)
+
+	// Delegate to macvlan plugin for cleanup if configured
+	if conf.MacVLAN != nil && conf.MacVLAN.Enable {
+		log.Printf("Delegating cleanup to macvlan plugin: master=%s name=%s", conf.MacVLAN.Master, conf.MacVLAN.Name)
+
+		if err := delegateMacvlanDel(args, conf); err != nil {
+			// Log but don't fail - cleanup is best-effort
+			log.Printf("Warning: failed to delegate macvlan cleanup: %v", err)
+		} else {
+			log.Printf("Successfully delegated macvlan cleanup")
+		}
+	}
+
 	return nil
 }
 

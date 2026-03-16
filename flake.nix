@@ -53,7 +53,7 @@
               inherit version;
               src = ./.;
 
-              vendorHash = "sha256-/RFNDfoU59iwtRCMp+yrBwhjpMY+rEL+h/68ggrqiB4=";
+              vendorHash = "sha256-qfXHRr0rDvXqajrBQtgmQpdcIwWwxypRuH89Uuy890U=";
 
               # Build both binaries
               subPackages = [
