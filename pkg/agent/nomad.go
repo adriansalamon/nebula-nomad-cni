@@ -1,7 +1,9 @@
 package agent
 
 import (
+	"encoding/json"
 	"fmt"
+	"maps"
 
 	"github.com/hashicorp/nomad/api"
 )
@@ -85,27 +87,20 @@ func (nc *NomadClient) GetTaskMetadata(allocID string) (*TaskMetadata, error) {
 	allMeta := make(map[string]string)
 
 	if job.Meta != nil {
-		for k, v := range job.Meta {
-			allMeta[k] = v
-		}
+		maps.Copy(allMeta, job.Meta)
 	}
 
 	if selectedTask.Meta != nil {
-		for k, v := range selectedTask.Meta {
-			allMeta[k] = v
-		}
+		maps.Copy(allMeta, selectedTask.Meta)
 	}
 
 	// Extract roles from metadata
 	var roles []string
 	if rolesStr, ok := allMeta["nebula_roles"]; ok {
 		// Parse comma-separated roles
-		if rolesStr != "" {
-			for _, role := range splitAndTrim(rolesStr, ",") {
-				if role != "" {
-					roles = append(roles, role)
-				}
-			}
+		err := json.Unmarshal([]byte(rolesStr), &roles)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse roles: %w", err)
 		}
 	}
 

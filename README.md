@@ -88,8 +88,7 @@ note: You could probably run this in other ways, e.g. as a nomad system job.
        },
        {
          "type": "nebula-nomad-cni",
-         "socket_path": "/var/run/nebula-cni.sock",
-         "roles_meta_key": "nebula_roles"
+         "socket_path": "/var/run/nebula-cni.sock"
        }
      ]
    }
@@ -128,23 +127,27 @@ job "web-app" {
 
       meta {
         # roles to be assigned to nebula certificate
-        nebula_roles = "web"
+        nebula_roles = jsonencode(["web-client"])
 
-        # Custom Nebula firewall config
-        nebula_config = <<EOF
-firewall:
-  outbound:
-    - port: any
-      proto: any
-      host: any
-  inbound:
-    - proto: icmp
-      port: any
-      host: any
-    - port: 80
-      proto: tcp
-      group: web-client
-EOF
+        # Custom Nebula config, e.g. firewall rules
+        nebula_config = jsonencode({
+          firewall = {
+            outbound = [
+              {
+                proto = "any"
+                ports = "any"
+                host = "any"
+              }
+            ]
+            inbound = [
+              {
+                proto = "tcp"
+                ports = "80"
+                host = "any"
+              }
+            ]
+          }
+        })
       }
 
       config {

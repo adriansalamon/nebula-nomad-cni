@@ -324,8 +324,7 @@ func cmdStatus(args *skel.CmdArgs) error {
 // parseNetConf parses the CNI network configuration.
 func parseNetConf(data []byte) (*NetConf, error) {
 	conf := &NetConf{
-		SocketPath:   client.DefaultSocketPath,
-		RolesMetaKey: "nebula_roles",
+		SocketPath: client.DefaultSocketPath,
 	}
 
 	if err := json.Unmarshal(data, conf); err != nil {
