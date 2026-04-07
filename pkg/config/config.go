@@ -17,7 +17,17 @@ type Config struct {
 	NebulaConfigPath string        `toml:"nebula_config_path"`
 	WorkerBinaryPath string        `toml:"worker_binary_path"`
 	CertTTL          time.Duration `toml:"cert_ttl"`
+	SignerType       string        `toml:"signer_type"` // "local" or "vault"
+	Vault            VaultConfig   `toml:"vault"`
 	IPPool           IPPoolConfig  `toml:"ip_pool"`
+}
+
+// VaultConfig defines the Vault integration settings.
+type VaultConfig struct {
+	Addr       string `toml:"addr"`
+	Mount      string `toml:"mount"`
+	RoleID     string `toml:"role_id"`
+	SecretPath string `toml:"secret_id_path"`
 }
 
 // IPPoolConfig defines the IP allocation pool settings.
@@ -38,6 +48,7 @@ func DefaultConfig() *Config {
 		NebulaConfigPath: "/etc/nebula-cni/nebula-config.yaml",
 		WorkerBinaryPath: "/usr/local/bin/nebula-nomad-worker",
 		CertTTL:          1 * time.Hour,
+		SignerType:       "local",
 	}
 }
 

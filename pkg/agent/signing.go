@@ -12,8 +12,14 @@ import (
 	"golang.org/x/crypto/curve25519"
 )
 
-// CertificateSigner handles signing Nebula certificates using a CA certificate.
-type CertificateSigner struct {
+// Signer is an interface for signing Nebula certificates.
+type Signer interface {
+	SignCertificate(ipStr string, roles []string, name string, duration time.Duration) (certPEM string, keyPEM string, err error)
+	GetCACertificate() (string, error)
+}
+
+// LocalSigner handles signing Nebula certificates using a local CA certificate and key.
+type LocalSigner struct {
 	caCertPath string
 	caKeyPath  string
 	caCert     cert.Certificate
@@ -21,24 +27,24 @@ type CertificateSigner struct {
 	caCurve    cert.Curve
 }
 
-// NewCertificateSigner creates a new certificate signer with the given CA paths.
-func NewCertificateSigner(caCertPath, caKeyPath string) (*CertificateSigner, error) {
-	cs := &CertificateSigner{
+// NewLocalSigner creates a new local certificate signer with the given CA paths.
+func NewLocalSigner(caCertPath, caKeyPath string) (*LocalSigner, error) {
+	ls := &LocalSigner{
 		caCertPath: caCertPath,
 		caKeyPath:  caKeyPath,
 	}
 
-	if err := cs.loadCA(); err != nil {
+	if err := ls.loadCA(); err != nil {
 		return nil, err
 	}
 
-	return cs, nil
+	return ls, nil
 }
 
 // loadCA loads the CA certificate and key from disk.
-func (cs *CertificateSigner) loadCA() error {
+func (ls *LocalSigner) loadCA() error {
 	// Load CA certificate
-	caCertPEM, err := os.ReadFile(cs.caCertPath)
+	caCertPEM, err := os.ReadFile(ls.caCertPath)
 	if err != nil {
 		return fmt.Errorf("failed to read CA certificate: %w", err)
 	}
@@ -52,10 +58,10 @@ func (cs *CertificateSigner) loadCA() error {
 		return fmt.Errorf("certificate is not a CA certificate")
 	}
 
-	cs.caCert = caCert
+	ls.caCert = caCert
 
 	// Load CA private key
-	caKeyPEM, err := os.ReadFile(cs.caKeyPath)
+	caKeyPEM, err := os.ReadFile(ls.caKeyPath)
 	if err != nil {
 		return fmt.Errorf("failed to read CA key: %w", err)
 	}
@@ -69,8 +75,8 @@ func (cs *CertificateSigner) loadCA() error {
 		return fmt.Errorf("failed to verify CA key: %w", err)
 	}
 
-	cs.caKey = caKeyBytes
-	cs.caCurve = caCurve
+	ls.caKey = caKeyBytes
+	ls.caCurve = caCurve
 
 	return nil
 }
@@ -78,7 +84,7 @@ func (cs *CertificateSigner) loadCA() error {
 // SignCertificate signs a new certificate for the given IP and roles.
 // Returns the certificate and private key as PEM-encoded strings.
 // ipStr should be in CIDR notation (e.g., "10.99.0.1/24")
-func (cs *CertificateSigner) SignCertificate(ipStr string, roles []string, name string, duration time.Duration) (certPEM string, keyPEM string, err error) {
+func (ls *LocalSigner) SignCertificate(ipStr string, roles []string, name string, duration time.Duration) (certPEM string, keyPEM string, err error) {
 	// Parse IP address to netip.Prefix
 	// IP should already have CIDR notation (e.g., "10.99.0.1/24")
 	prefix, err := netip.ParsePrefix(ipStr)
@@ -88,7 +94,7 @@ func (cs *CertificateSigner) SignCertificate(ipStr string, roles []string, name 
 
 	// Generate new key pair for the certificate
 	// Use the same curve as the CA
-	pubKey, privKey, err := generateKeyPairForCurve(cs.caCurve)
+	pubKey, privKey, err := generateKeyPairForCurve(ls.caCurve)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to generate key pair: %w", err)
 	}
@@ -96,7 +102,7 @@ func (cs *CertificateSigner) SignCertificate(ipStr string, roles []string, name 
 	notBefore := time.Now()
 	notAfter := notBefore.Add(duration)
 
-	switch cs.caCert.Version() {
+	switch ls.caCert.Version() {
 	case cert.Version1:
 		return "", "", fmt.Errorf("not implemented")
 	case cert.Version2:
@@ -110,11 +116,11 @@ func (cs *CertificateSigner) SignCertificate(ipStr string, roles []string, name 
 			NotBefore: notBefore,
 			NotAfter:  notAfter,
 			PublicKey: pubKey,
-			Curve:     cs.caCurve,
+			Curve:     ls.caCurve,
 		}
 
 		// Sign the certificate
-		nc, err := tbs.Sign(cs.caCert, cs.caCurve, cs.caKey)
+		nc, err := tbs.Sign(ls.caCert, ls.caCurve, ls.caKey)
 		if err != nil {
 			return "", "", fmt.Errorf("failed to sign certificate: %w", err)
 		}
@@ -126,19 +132,19 @@ func (cs *CertificateSigner) SignCertificate(ipStr string, roles []string, name 
 		}
 
 		// Marshal private key to PEM
-		keyPEMBytes := cert.MarshalPrivateKeyToPEM(cs.caCurve, privKey)
+		keyPEMBytes := cert.MarshalPrivateKeyToPEM(ls.caCurve, privKey)
 
 		return string(certPEMBytes), string(keyPEMBytes), nil
 	default:
-		return "", "", fmt.Errorf("unsupported certificate version: %v", cs.caCert.Version())
+		return "", "", fmt.Errorf("unsupported certificate version: %v", ls.caCert.Version())
 	}
 
 }
 
 // GetCACertificate returns the CA certificate as a PEM-encoded string.
 // This is useful for distributing to clients.
-func (cs *CertificateSigner) GetCACertificate() (string, error) {
-	caCertPEM, err := cs.caCert.MarshalPEM()
+func (ls *LocalSigner) GetCACertificate() (string, error) {
+	caCertPEM, err := ls.caCert.MarshalPEM()
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal CA cert to PEM: %w", err)
 	}

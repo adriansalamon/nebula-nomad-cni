@@ -3,9 +3,10 @@ package agent
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"sync"
+
+	"github.com/sirupsen/logrus"
 
 	"github.com/adriansalamon/nebula-nomad-cni/pkg/worker"
 	"github.com/coreos/go-systemd/v22/dbus"
@@ -20,6 +21,7 @@ type NebulaManager struct {
 	instances        map[string]*NebulaInstance
 	instancesLock    sync.RWMutex
 	systemdConn      *dbus.Conn
+	logger           *logrus.Entry
 }
 
 // NebulaInstance represents a running Nebula worker process.
@@ -29,11 +31,12 @@ type NebulaInstance struct {
 }
 
 // NewNebulaManager creates a new Nebula instance manager.
-func NewNebulaManager(nebulaConfig, workerBinaryPath string) *NebulaManager {
+func NewNebulaManager(nebulaConfig, workerBinaryPath string, logger *logrus.Entry) *NebulaManager {
 	return &NebulaManager{
 		nebulaConfig:     nebulaConfig,
 		workerBinaryPath: workerBinaryPath,
 		instances:        make(map[string]*NebulaInstance),
+		logger:           logger.WithField("component", "nebula-manager"),
 	}
 }
 
@@ -65,7 +68,7 @@ func (nm *NebulaManager) StartInstance(allocID, ip, certPEM, keyPEM, caCertPEM, 
 
 	// Stop any existing unit with this namespace
 	if err := nm.stopExistingUnit(conn, unitName); err != nil {
-		log.Printf("Warning: failed to stop existing unit %s: %v", unitName, err)
+		nm.logger.Warnf("failed to stop existing unit %s: %v", unitName, err)
 		// Continue anyway - we'll try to create the unit
 	}
 
@@ -86,7 +89,7 @@ func (nm *NebulaManager) StartInstance(allocID, ip, certPEM, keyPEM, caCertPEM, 
 		return fmt.Errorf("failed to start systemd unit: %w", err)
 	}
 
-	log.Printf("Started systemd unit %s for allocation %s", unitName, allocID)
+	nm.logger.Infof("Started systemd unit %s for allocation %s", unitName, allocID)
 
 	// Create instance record
 	instance := &NebulaInstance{
@@ -132,18 +135,16 @@ func (nm *NebulaManager) stopExistingUnit(conn *dbus.Conn, unitName string) erro
 		return nil // Unit doesn't exist
 	}
 
-	// Stop the unit if it's active
 	if unit.ActiveState == "active" || unit.ActiveState == "activating" {
-		log.Printf("Stopping existing unit %s (state: %s)", unitName, unit.ActiveState)
+		nm.logger.Infof("Stopping existing unit %s (state: %s)", unitName, unit.ActiveState)
 		_, err := conn.StopUnitContext(context.TODO(), unitName, "replace", nil)
 		if err != nil {
 			return fmt.Errorf("failed to stop unit: %w", err)
 		}
 	}
 
-	// Reset any failed state
 	if err := conn.ResetFailedUnitContext(context.TODO(), unitName); err != nil {
-		log.Printf("Warning: failed to reset unit state: %v", err)
+		nm.logger.Warnf("failed to reset unit state: %v", err)
 	}
 
 	return nil
@@ -168,7 +169,7 @@ func (nm *NebulaManager) StopInstance(allocID string) error {
 	// Stop the systemd unit
 	_, err = conn.StopUnitContext(context.TODO(), instance.UnitName, "replace", nil)
 	if err != nil {
-		log.Printf("Warning: failed to stop systemd unit %s: %v", instance.UnitName, err)
+		nm.logger.Warnf("failed to stop systemd unit %s: %v", instance.UnitName, err)
 		// Continue with cleanup even if stop fails
 	}
 
@@ -177,7 +178,7 @@ func (nm *NebulaManager) StopInstance(allocID string) error {
 	_ = os.RemoveAll(socketPath)
 
 	delete(nm.instances, allocID)
-	log.Printf("Stopped Nebula worker for allocation %s", allocID)
+	nm.logger.Infof("Stopped Nebula worker for allocation %s", allocID)
 
 	return nil
 }
@@ -196,7 +197,7 @@ func (nm *NebulaManager) StopAll() {
 	nm.instancesLock.Lock()
 	defer nm.instancesLock.Unlock()
 
-	log.Printf("Stopping all Nebula instances (%d running)", len(nm.instances))
+	nm.logger.Infof("Stopping all Nebula instances (%d running)", len(nm.instances))
 
 	for allocID := range nm.instances {
 		// Stop without holding the lock (StopInstance acquires it)
@@ -204,7 +205,7 @@ func (nm *NebulaManager) StopAll() {
 		id := allocID
 		nm.instancesLock.Unlock()
 		if err := nm.StopInstance(id); err != nil {
-			log.Printf("Warning: failed to stop instance %s: %v", id, err)
+			nm.logger.Warnf("failed to stop instance %s: %v", id, err)
 		}
 		nm.instancesLock.Lock()
 	}
@@ -215,7 +216,7 @@ func (nm *NebulaManager) StopAll() {
 		nm.systemdConn = nil
 	}
 
-	log.Printf("All Nebula instances stopped")
+	nm.logger.Info("All Nebula instances stopped")
 }
 
 // generateInstanceConfigString generates a Nebula config string with inline certs.
@@ -300,7 +301,7 @@ func (nm *NebulaManager) ReloadConfig(allocID, newConfigString string) error {
 		return fmt.Errorf("failed to reload config via RPC: %w", err)
 	}
 
-	log.Printf("Successfully reloaded config for allocation %s", allocID)
+	nm.logger.Infof("Successfully reloaded config for allocation %s", allocID)
 	return nil
 }
 

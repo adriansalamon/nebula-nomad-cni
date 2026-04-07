@@ -1,38 +1,27 @@
-# Binaries
-build/
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
-mnt/
-result
+# Allowlisting gitignore template for GO projects prevents us
+# from adding various unwanted local files, such as generated
+# files, developer configurations or IDE-specific files etc.
+#
+# Recommended: Go.AllowList.gitignore
 
-# Test binaries
-*.test
-*.out
+# Ignore everything
+*
 
-# Go workspace file
-go.work
+# But not these files...
+!/.gitignore
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
+!*.go
+!go.sum
+!go.mod
 
-# OS
-.DS_Store
+!README.md
+!LICENSE
 
-# Logs
-*.log
+# !Makefile
 
-# Certificates (do not commit!)
-*.crt
-*.key
-*.pem
+!flake.nix
+!flake.lock
 
-# Local development
-/tmp/
-/test-data/
+# ...even if they are in subdirectories
+!*/
+

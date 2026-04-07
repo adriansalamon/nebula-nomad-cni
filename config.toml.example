@@ -9,17 +9,18 @@ consul_addr = "127.0.0.1:8500"
 # Nomad server address
 nomad_addr = "http://127.0.0.1:4646"
 
-# Path to Nebula CA certificate
-ca_cert_path = "/path/to/ca.crt"
+# Certificate Signing Configuration
+# signer_type can be "local" (default) or "vault"
+signer_type = "local"
+cert_ttl = "1h"
 
-# Path to Nebula CA private key
+# Required for signer_type = "local"
+ca_cert_path = "/path/to/ca.crt"
 ca_key_path = "/path/to/ca.key"
+
 
 # Path to base Nebula config template
 nebula_config_path = "/path/to/nebula-config.yaml"
-
-# Certificate TTL (duration format: 1h, 24h, etc.)
-cert_ttl = "1h"
 
 # Path to nebula-nomad-worker binary
 worker_binary_path = "/usr/local/bin/nebula-nomad-worker"
@@ -32,3 +33,16 @@ network_cidr = "10.99.0.0/24"
 # IP allocation range
 range_start = "10.99.0.1"
 range_end = "10.99.0.100"
+
+# Required for signer_type = "vault"
+[vault]
+# Vault server address
+addr = "http://127.0.0.1:8200"
+
+# Mount path of the nebula-vault-plugin (e.g., "nebula")
+mount = "nebula"
+
+# Optional: AppRole authentication.
+# If role_id is empty, the agent will rely on the VAULT_TOKEN environment variable.
+role_id = ""
+secret_id_path = "/etc/nebula-cni/vault-secret-id"

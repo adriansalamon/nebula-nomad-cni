@@ -118,6 +118,25 @@ func (cm *ConsulManager) InitializeIPPool(networkCIDR, rangeStart, rangeEnd stri
 	return nil
 }
 
+// GetIPPool retrieves the current IP pool from Consul.
+func (cm *ConsulManager) GetIPPool() (*IPPool, error) {
+	pair, _, err := cm.client.KV().Get(consulIPPoolKey, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get IP pool: %w", err)
+	}
+
+	if pair == nil {
+		return nil, fmt.Errorf("IP pool not initialized")
+	}
+
+	var pool IPPool
+	if err := json.Unmarshal(pair.Value, &pool); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal pool: %w", err)
+	}
+
+	return &pool, nil
+}
+
 // AllocateIP atomically allocates an IP address from the pool.
 func (cm *ConsulManager) AllocateIP() (string, error) {
 	kv := cm.client.KV()
@@ -384,16 +403,6 @@ func (cm *ConsulManager) findNextAvailableIP(pool *IPPool) (string, error) {
 	}
 
 	return "", fmt.Errorf("no available IPs in range %s-%s", pool.RangeStart, pool.RangeEnd)
-}
-
-// inc increments an IP address.
-func inc(ip net.IP) {
-	for j := len(ip) - 1; j >= 0; j-- {
-		ip[j]++
-		if ip[j] > 0 {
-			break
-		}
-	}
 }
 
 // ipToInt converts an IP address to a uint32 (for IPv4).

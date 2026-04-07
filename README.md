@@ -1,10 +1,14 @@
 # Nebula CNI for Nomad
 
-A CNI plugin and agent service that provides [nebula](https://github.com/slackhq/nebula) overlay networking for Nomad tasks. Could probably be adapted for use in k8s setups, but built with Nomad in mind.
+A CNI plugin and agent service that provides
+[nebula](https://github.com/slackhq/nebula) overlay networking for Nomad tasks.
+Could probably be adapted for use in k8s setups, but built with Nomad in mind.
 
 ## Overview
 
 - **Automatic IP allocation** for Nomad jobs via Consul.
+- **Pluggable Certificate Signing**: Support for local CA (disk-based) or **Vault Zero-Knowledge signing** using the `nebula-vault-plugin`.
+- **Zero-knowledge PKI**: Only public keys are sent to Vault; private keys never leave the Nomad client node.
 - **Certificate management**: Automatic issuing, signing, and **zero-downtime rotation**.
 - **Distributed state**: Consul manages IP pools and allocation records across the cluster.
 - **Process Isolation**: Each Nebula instance runs in a separate worker process within the task's network namespace.
@@ -14,7 +18,7 @@ A CNI plugin and agent service that provides [nebula](https://github.com/slackhq
 ### Components
 
 1.  **nebula-nomad-agent** - Long-lived systemd service running on each Nomad client.
-    - Manages IP allocation and certificate signing.
+    - Manages IP allocation and certificate signing (Local or Vault-backed).
     - Orchestrates **nebula-nomad-worker** processes using systemd transient units.
     - Handles certificate rotation by pushing new configs to workers via Unix sockets.
 2.  **nebula-nomad-worker** - Short-lived process managed by the agent.
@@ -29,7 +33,7 @@ A CNI plugin and agent service that provides [nebula](https://github.com/slackhq
 
 ### Prerequisites
 
-1.  **Nebula CA Certificate** - All agents must share the same CA certificate.
+1.  **Nebula CA** - Either a local CA (cert/key on disk) or a Vault server with the [nebula-vault-plugin](https://github.com/adriansalamon/nebula-vault-plugin) installed.
 2.  **Consul** - Cluster-wide storage for IP pools.
 3.  **Config file** - Create `/etc/nebula-cni/agent.toml`. See [config.toml.example](config.toml.example).
 4.  **Install Binaries** - Place `nebula-nomad-agent`, `nebula-nomad-worker`, and `nebula-nomad-cni` in appropriate paths (e.g., `/usr/local/bin/` and `/opt/cni/bin/`).
@@ -55,47 +59,65 @@ WantedBy=multi-user.target
 
 note: You could probably run this in other ways, e.g. as a nomad system job.
 
+### Vault Integration (Optional)
+
+The agent supports the
+[nebula-vault-plugin](https://github.com/adriansalamon/nebula-vault-plugin),
+enabling a secure **Zero-Knowledge** PKI workflow. Private keys are generated
+locally on the Nomad client and never leave its memory; only public keys are
+sent to Vault for signing.
+
+Authentication is supported via either a fixed `VAULT_TOKEN` or a persistent
+**AppRole** (via `role_id` and `secret_id_path`).
+
+### Logging
+
+The agent and CNI plugin both support structured, leveled logging via `logrus`. Verbosity can be controlled via environment variables:
+
+- `LOG_LEVEL`: For the `nebula-nomad-agent` (default: `info`).
+- `NEBULA_CNI_LOG_LEVEL`: For the `nebula-nomad-cni` binary (default: `info`).
+
 ### CNI Plugin Setup
 
 1.  **Install CNI Binary** - Place `nebula-nomad-cni` in `/opt/cni/bin/`.
 2.  **Create CNI Configuration** (`/opt/cni/config/nebula.conflist`):
 
-   ```json
-   {
-     "cniVersion": "1.0.0",
-     "name": "nebula",
-     "plugins": [
-       {
-         "type": "loopback"
-       },
-       {
-         "type": "bridge",
-         "bridge": "nomad",
-         "isGateway": true,
-         "ipMasq": true,
-         "ipam": {
-           "type": "host-local",
-           "ranges": [
-             [
-               {
-                 "subnet": "172.26.64.0/20"
-               }
-             ]
-           ],
-           "routes": [{ "dst": "0.0.0.0/0" }]
-         }
-       },
-       {
-         "type": "firewall",
-         "backend": "iptables"
-       },
-       {
-         "type": "nebula-nomad-cni",
-         "socket_path": "/var/run/nebula-cni.sock"
-       }
-     ]
-   }
-   ```
+```json
+{
+  "cniVersion": "1.0.0",
+  "name": "nebula",
+  "plugins": [
+    {
+      "type": "loopback"
+    },
+    {
+      "type": "bridge",
+      "bridge": "nomad",
+      "isGateway": true,
+      "ipMasq": true,
+      "ipam": {
+        "type": "host-local",
+        "ranges": [
+          [
+            {
+              "subnet": "172.26.64.0/20"
+            }
+          ]
+        ],
+        "routes": [{ "dst": "0.0.0.0/0" }]
+      }
+    },
+    {
+      "type": "firewall",
+      "backend": "iptables"
+    },
+    {
+      "type": "nebula-nomad-cni",
+      "socket_path": "/var/run/nebula-cni.sock"
+    }
+  ]
+}
+```
 
 #### Advanced CNI Options
 
@@ -186,12 +208,13 @@ job "web-app" {
 
 The `nebula-nomad-agent` extracts configuration from the Nomad job metadata:
 
--   `nebula_roles`: A JSON-encoded list of roles/groups to assign to the Nebula certificate.
--   `nebula_config`: A JSON-encoded object of Nebula configuration overrides (e.g., firewall rules).
+- `nebula_roles`: A JSON-encoded list of roles/groups to assign to the Nebula certificate.
+- `nebula_config`: A JSON-encoded object of Nebula configuration overrides (e.g., firewall rules).
 
 ### Certificate Rotation
 
 The agent automatically handles certificate rotation before they expire.
+
 1. It periodially checks active allocations.
 2. If less than 25% of the certificate's TTL remains, it signs a new certificate.
 3. It pushes the new configuration to the `nebula-nomad-worker` process via its Unix socket.
@@ -199,9 +222,11 @@ The agent automatically handles certificate rotation before they expire.
 
 ### State Management & Recovery
 
--   **Consul** is the source of truth for IP allocations.
--   On startup, the agent checks Nomad for running allocations and restarts any missing `nebula-nomad-worker` processes.
--   Stale allocation records in Consul are automaticallly cleaned up if the corresponding Nomad task no longer exists.
+- **Consul** is the source of truth for IP allocations.
+- On startup, the agent checks Nomad for running allocations and restarts any
+  missing `nebula-nomad-worker` processes.
+- Stale allocation records in Consul are automaticallly cleaned up if the
+  corresponding Nomad task no longer exists.
 
 ## References
 

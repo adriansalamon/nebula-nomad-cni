@@ -4,10 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net"
 	"os"
 	"strings"
+
+	"github.com/sirupsen/logrus"
 
 	"github.com/containernetworking/cni/pkg/invoke"
 	"github.com/containernetworking/cni/pkg/skel"
@@ -58,7 +59,16 @@ type CNIArgs struct {
 
 func main() {
 	// Log to stderr (captured by systemd/journald)
-	log.SetOutput(os.Stderr)
+	logrus.SetOutput(os.Stderr)
+	// Set level from env or default to Info
+	level, _ := logrus.ParseLevel(os.Getenv("NEBULA_CNI_LOG_LEVEL"))
+	if level == 0 {
+		level = logrus.InfoLevel
+	}
+	logrus.SetLevel(level)
+	logrus.SetFormatter(&logrus.TextFormatter{
+		DisableTimestamp: true, // systemd/nomad already adds timestamps
+	})
 
 	funcs := skel.CNIFuncs{
 		Add:    cmdAdd,
@@ -72,7 +82,6 @@ func main() {
 
 // cmdAdd is called when a container is created.
 func cmdAdd(args *skel.CmdArgs) error {
-	log.Printf("CNI ADD called: ContainerID=%s Netns=%s IfName=%s", args.ContainerID, args.Netns, args.IfName)
 
 	// Parse network configuration
 	conf, err := parseNetConf(args.StdinData)
@@ -87,9 +96,6 @@ func cmdAdd(args *skel.CmdArgs) error {
 	}
 
 	allocID := cniArgs.NOMAD_ALLOC_ID
-
-	log.Printf("CNI_ARGS: %s", args.Args)
-	log.Printf("Allocation ID: %s", allocID)
 
 	if allocID == "" || args.Netns == "" {
 		return fmt.Errorf("missing required fields: alloc_id=%s netns=%s", allocID, args.Netns)
@@ -107,16 +113,13 @@ func cmdAdd(args *skel.CmdArgs) error {
 	ctx := context.Background()
 	resp, err := c.Allocate(ctx, req)
 	if err != nil {
-		log.Printf("Failed to allocate: %v", err)
+		logrus.Errorf("Failed to allocate: %v", err)
 		return fmt.Errorf("failed to allocate from agent: %w", err)
 	}
 
 	if !resp.Success {
-		log.Printf("Agent returned error: %s", resp.Error)
 		return fmt.Errorf("agent error: %s", resp.Error)
 	}
-
-	log.Printf("Successfully allocated IP %s for allocation %s", resp.IP, cniArgs.NOMAD_ALLOC_ID)
 
 	// Build result for Nebula interface
 	ipNet := mustParseCIDR(resp.IP)
@@ -132,10 +135,6 @@ func cmdAdd(args *skel.CmdArgs) error {
 		// Preserve all previous result data (interfaces, routes, DNS, etc.)
 		result = conf.PrevResult
 		result.IPs = append([]*current.IPConfig{nebulaIP}, result.IPs...)
-
-		// Ensure routes are preserved from bridge plugin
-		// The default route should still point to eth0's gateway
-		log.Printf("Preserved %d routes from previous plugins", len(result.Routes))
 	} else {
 		// Standalone mode: return only Nebula IP
 		result = &current.Result{
@@ -146,7 +145,6 @@ func cmdAdd(args *skel.CmdArgs) error {
 
 	// Delegate to macvlan plugin if configured
 	if conf.MacVLAN != nil && conf.MacVLAN.Enable {
-		log.Printf("Delegating to macvlan plugin: master=%s name=%s", conf.MacVLAN.Master, conf.MacVLAN.Name)
 
 		macvlanResult, err := delegateMacvlan(args, conf)
 		if err != nil {
@@ -157,9 +155,6 @@ func cmdAdd(args *skel.CmdArgs) error {
 		result.Interfaces = append(result.Interfaces, macvlanResult.Interfaces...)
 		result.IPs = append(result.IPs, macvlanResult.IPs...)
 		result.Routes = append(result.Routes, macvlanResult.Routes...)
-
-		log.Printf("Successfully delegated to macvlan, added %d interfaces, %d IPs, %d routes",
-			len(macvlanResult.Interfaces), len(macvlanResult.IPs), len(macvlanResult.Routes))
 	}
 
 	// Return combined result
@@ -241,7 +236,6 @@ func delegateMacvlanDel(args *skel.CmdArgs, conf *NetConf) error {
 
 // cmdDel is called when a container is deleted.
 func cmdDel(args *skel.CmdArgs) error {
-	log.Printf("CNI DEL called: ContainerID=%s Netns=%s", args.ContainerID, args.Netns)
 
 	// Parse network configuration
 	conf, err := parseNetConf(args.StdinData)
@@ -257,22 +251,15 @@ func cmdDel(args *skel.CmdArgs) error {
 
 	allocID := cniArgs.NOMAD_ALLOC_ID
 
-	log.Printf("CNI_ARGS: %s", args.Args)
-	log.Printf("Extracted NOMAD_ALLOC_ID: %s", allocID)
-
 	if allocID == "" {
 		// Fallback: try using ContainerID as allocation ID
 		// In Nomad, ContainerID often equals the allocation ID
 		if args.ContainerID != "" {
-			log.Printf("NOMAD_ALLOC_ID not found, trying ContainerID: %s", args.ContainerID)
 			allocID = types.UnmarshallableString(args.ContainerID)
 		} else {
-			log.Printf("Warning: No allocation ID found in CNI_ARGS and no ContainerID, cannot deallocate")
 			return nil
 		}
 	}
-
-	log.Printf("Deallocating allocation %s", allocID)
 
 	// Create client
 	c := client.NewClient(conf.SocketPath)
@@ -281,26 +268,20 @@ func cmdDel(args *skel.CmdArgs) error {
 	ctx := context.Background()
 	resp, err := c.Deallocate(ctx, string(allocID))
 	if err != nil {
-		log.Printf("Failed to deallocate: %v", err)
+		logrus.Errorf("Failed to deallocate: %v", err)
 		return fmt.Errorf("failed to deallocate: %w", err)
 	}
 
 	if !resp.Success {
-		log.Printf("Agent returned error: %s", resp.Error)
 		return fmt.Errorf("agent error: %s", resp.Error)
 	}
 
-	log.Printf("Successfully deallocated allocation %s", allocID)
-
 	// Delegate to macvlan plugin for cleanup if configured
 	if conf.MacVLAN != nil && conf.MacVLAN.Enable {
-		log.Printf("Delegating cleanup to macvlan plugin: master=%s name=%s", conf.MacVLAN.Master, conf.MacVLAN.Name)
 
 		if err := delegateMacvlanDel(args, conf); err != nil {
 			// Log but don't fail - cleanup is best-effort
-			log.Printf("Warning: failed to delegate macvlan cleanup: %v", err)
-		} else {
-			log.Printf("Successfully delegated macvlan cleanup")
+			logrus.Warnf("failed to delegate macvlan cleanup: %v", err)
 		}
 	}
 
@@ -309,14 +290,11 @@ func cmdDel(args *skel.CmdArgs) error {
 
 // cmdCheck is called to verify the container's networking is as expected.
 func cmdCheck(args *skel.CmdArgs) error {
-	log.Printf("CNI CHECK called: ContainerID=%s", args.ContainerID)
 	// For now, just return success
 	return nil
 }
 
 func cmdStatus(args *skel.CmdArgs) error {
-	log.Printf("CNI STATUS called: ContainerID=%s", args.ContainerID)
-
 	// For now, just return success
 	return nil
 }

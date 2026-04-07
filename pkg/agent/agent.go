@@ -3,7 +3,6 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"os"
@@ -11,6 +10,7 @@ import (
 
 	"github.com/adriansalamon/nebula-nomad-cni/pkg/client"
 	"github.com/gorilla/mux"
+	"github.com/sirupsen/logrus"
 )
 
 // Config holds the configuration for the agent.
@@ -30,14 +30,14 @@ type Agent struct {
 	config        *Config
 	consulManager *ConsulManager
 	nomadClient   *NomadClient
-	certSigner    *CertificateSigner
+	certSigner    Signer
 	nebulaManager *NebulaManager
+	logger        *logrus.Entry
 	httpServer    *http.Server
 	listener      net.Listener
 }
 
-// NewAgent creates a new agent instance.
-func NewAgent(config *Config) (*Agent, error) {
+func NewAgent(config *Config, signer Signer) (*Agent, error) {
 	// Create Consul manager
 	consulManager, err := NewConsulManager(config.ConsulAddr)
 	if err != nil {
@@ -49,19 +49,26 @@ func NewAgent(config *Config) (*Agent, error) {
 		return nil, fmt.Errorf("failed to create Nomad client: %w", err)
 	}
 
-	certSigner, err := NewCertificateSigner(config.CACertPath, config.CAKeyPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create certificate signer: %w", err)
+	logger := logrus.New()
+	// Set level from env or default to Info
+	level, _ := logrus.ParseLevel(os.Getenv("LOG_LEVEL"))
+	if level == 0 {
+		level = logrus.InfoLevel
 	}
+	logger.SetLevel(level)
+	logger.SetFormatter(&logrus.TextFormatter{FullTimestamp: true})
 
-	nebulaManager := NewNebulaManager(config.NebulaConfig, config.WorkerBinaryPath)
+	agentLogger := logger.WithField("component", "agent")
+
+	nebulaManager := NewNebulaManager(config.NebulaConfig, config.WorkerBinaryPath, agentLogger)
 
 	return &Agent{
 		config:        config,
 		consulManager: consulManager,
 		nomadClient:   nomadClient,
-		certSigner:    certSigner,
+		certSigner:    signer,
 		nebulaManager: nebulaManager,
+		logger:        agentLogger,
 	}, nil
 }
 
@@ -69,13 +76,13 @@ func NewAgent(config *Config) (*Agent, error) {
 func (a *Agent) Start() error {
 	// Clean up stale allocations on startup
 	if err := a.cleanupStaleAllocations(); err != nil {
-		log.Printf("Warning: failed to cleanup stale allocations: %v", err)
+		a.logger.Warnf("failed to cleanup stale allocations: %v", err)
 		// Don't fail startup, just log warning
 	}
 
 	// Restart active Nebula instances for allocations on this node
 	if err := a.restartLocalInstances(); err != nil {
-		log.Printf("Warning: failed to restart local instances: %v", err)
+		a.logger.Warnf("failed to restart local instances: %v", err)
 		// Don't fail startup, just log warning
 	}
 
@@ -109,10 +116,13 @@ func (a *Agent) Start() error {
 		Handler: router,
 	}
 
-	log.Printf("Agent listening on %s", a.config.SocketPath)
+	a.logger.Infof("Agent listening on %s", a.config.SocketPath)
 
 	// Start certificate rotation worker
 	a.startCertRotationWorker()
+
+	// Start background cleanup worker (runs every 1 hour)
+	a.startCleanupWorker()
 
 	// Start serving
 	if err := a.httpServer.Serve(listener); err != nil && err != http.ErrServerClosed {
@@ -124,7 +134,7 @@ func (a *Agent) Start() error {
 
 // Stop gracefully stops the agent and all running Nebula instances.
 func (a *Agent) Stop() error {
-	log.Printf("Stopping agent...")
+	a.logger.Info("Stopping agent...")
 
 	// Stop all Nebula instances first
 	a.nebulaManager.StopAll()
@@ -149,7 +159,7 @@ func (a *Agent) handleAllocate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("Allocate request for alloc_id=%s", req.AllocID)
+	a.logger.Infof("Allocate request for alloc_id=%s", req.AllocID)
 
 	// Validate request
 	if req.AllocID == "" || req.NetNS == "" {
@@ -160,23 +170,21 @@ func (a *Agent) handleAllocate(w http.ResponseWriter, r *http.Request) {
 	// Query Nomad API for task metadata
 	metadata, err := a.nomadClient.GetTaskMetadata(req.AllocID)
 	if err != nil {
-		log.Printf("Failed to get task metadata from Nomad: %v", err)
+		a.logger.Errorf("Failed to get task metadata from Nomad: %v", err)
 		a.sendError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get task metadata: %v", err))
 		return
 	}
 
-	log.Printf("Task metadata: job=%s group=%s task=%s roles=%v", metadata.JobID, metadata.TaskGroup, metadata.TaskName, metadata.Roles)
-
 	// Check if allocation already exists
 	existing, err := a.consulManager.GetAllocationRecord(req.AllocID)
 	if err != nil {
-		log.Printf("Error checking existing allocation: %v", err)
+		a.logger.Errorf("Error checking existing allocation: %v", err)
 		a.sendError(w, http.StatusInternalServerError, fmt.Sprintf("failed to check existing allocation: %v", err))
 		return
 	}
 
 	if existing != nil {
-		log.Printf("Allocation %s already exists with IP %s", req.AllocID, existing.IP)
+		a.logger.Warnf("Allocation %s already exists with IP %s", req.AllocID, existing.IP)
 		a.sendError(w, http.StatusConflict, "allocation already exists")
 		return
 	}
@@ -184,17 +192,15 @@ func (a *Agent) handleAllocate(w http.ResponseWriter, r *http.Request) {
 	// Allocate IP from Consul (already includes correct subnet mask from pool's NetworkCIDR)
 	ip, err := a.consulManager.AllocateIP()
 	if err != nil {
-		log.Printf("Failed to allocate IP: %v", err)
+		a.logger.Errorf("Failed to allocate IP: %v", err)
 		a.sendError(w, http.StatusInternalServerError, fmt.Sprintf("failed to allocate IP: %v", err))
 		return
 	}
 
-	log.Printf("Allocated IP %s for alloc_id=%s", ip, req.AllocID)
-
 	// Get CA cert for inlining
 	caCertPEM, err := a.certSigner.GetCACertificate()
 	if err != nil {
-		log.Printf("Failed to get CA certificate: %v", err)
+		a.logger.Errorf("Failed to get CA certificate: %v", err)
 		_ = a.consulManager.ReleaseIP(ip)
 		a.sendError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get CA certificate: %v", err))
 		return
@@ -204,25 +210,21 @@ func (a *Agent) handleAllocate(w http.ResponseWriter, r *http.Request) {
 	certName := fmt.Sprintf("%s.%s.%s", metadata.TaskName, metadata.TaskGroup, metadata.JobID)
 	certPEM, keyPEM, err := a.certSigner.SignCertificate(ip, metadata.Roles, certName, a.config.CertTTL)
 	if err != nil {
-		log.Printf("Failed to sign certificate: %v", err)
+		a.logger.Errorf("Failed to sign certificate: %v", err)
 		// Release IP since we failed
 		_ = a.consulManager.ReleaseIP(ip)
 		a.sendError(w, http.StatusInternalServerError, fmt.Sprintf("failed to sign certificate: %v", err))
 		return
 	}
 
-	log.Printf("Signed certificate for IP %s", ip)
-
 	// Start Nebula instance with job-specific config
 	if err := a.nebulaManager.StartInstance(req.AllocID, ip, certPEM, keyPEM, caCertPEM, metadata.NebulaConfig, req.NetNS); err != nil {
-		log.Printf("Failed to start Nebula instance: %v", err)
+		a.logger.Errorf("Failed to start Nebula instance: %v", err)
 		// Release IP and clean up
 		_ = a.consulManager.ReleaseIP(ip)
 		a.sendError(w, http.StatusInternalServerError, fmt.Sprintf("failed to start Nebula instance: %v", err))
 		return
 	}
-
-	log.Printf("Started Nebula instance for alloc_id=%s", req.AllocID)
 
 	// Store allocation record in Consul (minimal state - Nomad API is source of truth)
 	record := &client.AllocationRecord{
@@ -233,7 +235,7 @@ func (a *Agent) handleAllocate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := a.consulManager.StoreAllocationRecord(record); err != nil {
-		log.Printf("Failed to store allocation record: %v", err)
+		a.logger.Errorf("Failed to store allocation record: %v", err)
 		// Clean up Nebula instance and IP
 		_ = a.nebulaManager.StopInstance(req.AllocID)
 		_ = a.consulManager.ReleaseIP(ip)
@@ -241,7 +243,7 @@ func (a *Agent) handleAllocate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("Stored allocation record for alloc_id=%s", req.AllocID)
+	a.logger.Infof("Successfully allocated %s for %s", ip, req.AllocID)
 
 	// Send success response
 	resp := &client.AllocateResponse{
@@ -260,7 +262,7 @@ func (a *Agent) handleDeallocate(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	allocID := vars["alloc_id"]
 
-	log.Printf("Deallocate request for alloc_id=%s", allocID)
+	a.logger.Infof("Deallocate request for alloc_id=%s", allocID)
 
 	if allocID == "" {
 		a.sendError(w, http.StatusBadRequest, "alloc_id is required")
@@ -270,13 +272,13 @@ func (a *Agent) handleDeallocate(w http.ResponseWriter, r *http.Request) {
 	// Get allocation record to find IP
 	record, err := a.consulManager.GetAllocationRecord(allocID)
 	if err != nil {
-		log.Printf("Error getting allocation record: %v", err)
+		a.logger.Errorf("Error getting allocation record: %v", err)
 		a.sendError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get allocation record: %v", err))
 		return
 	}
 
 	if record == nil {
-		log.Printf("Allocation %s not found", allocID)
+		a.logger.Warnf("Allocation %s not found during deallocate", allocID)
 		// Not found, but that's okay - consider it success
 		resp := &client.DeallocateResponse{Success: true}
 		w.Header().Set("Content-Type", "application/json")
@@ -286,28 +288,24 @@ func (a *Agent) handleDeallocate(w http.ResponseWriter, r *http.Request) {
 
 	// Stop Nebula instance
 	if err := a.nebulaManager.StopInstance(allocID); err != nil {
-		log.Printf("Failed to stop Nebula instance: %v", err)
+		a.logger.Errorf("Failed to stop Nebula instance: %v", err)
 		// Continue with cleanup even if this fails
 	}
 
-	log.Printf("Stopped Nebula instance for alloc_id=%s", allocID)
-
 	// Release IP
 	if err := a.consulManager.ReleaseIP(record.IP); err != nil {
-		log.Printf("Failed to release IP: %v", err)
+		a.logger.Errorf("Failed to release IP %s: %v", record.IP, err)
 		// Continue with cleanup
 	}
 
-	log.Printf("Released IP %s", record.IP)
+	a.logger.Infof("Successfully deallocated %s for %s", record.IP, allocID)
 
 	// Delete allocation record
 	if err := a.consulManager.DeleteAllocationRecord(allocID); err != nil {
-		log.Printf("Failed to delete allocation record: %v", err)
+		a.logger.Errorf("Failed to delete allocation record for %s: %v", allocID, err)
 		a.sendError(w, http.StatusInternalServerError, fmt.Sprintf("failed to delete allocation record: %v", err))
 		return
 	}
-
-	log.Printf("Deleted allocation record for alloc_id=%s", allocID)
 
 	// Send success response
 	resp := &client.DeallocateResponse{Success: true}
@@ -338,81 +336,70 @@ func (a *Agent) sendError(w http.ResponseWriter, statusCode int, message string)
 // cleanupStaleAllocations cleans up allocations from previous agent runs
 // that may not have been properly deallocated.
 func (a *Agent) cleanupStaleAllocations() error {
-	log.Printf("Checking for stale allocations...")
+	a.logger.Debug("Performing full state cleanup check...")
 
-	// Get all allocation records from Consul
+	// 1. Clean up dangling records (Consul record exists but Nomad task is gone)
 	records, err := a.consulManager.GetAllAllocations()
 	if err != nil {
 		return fmt.Errorf("failed to get allocations: %w", err)
 	}
 
-	if len(records) == 0 {
-		log.Printf("No allocations found in Consul")
-		return nil
-	}
-
-	log.Printf("Found %d allocation(s) in Consul, checking if they are still active...", len(records))
-
-	cleaned := 0
-	for _, record := range records {
-		// Check if allocation still exists in Nomad
-		_, err := a.nomadClient.GetTaskMetadata(record.AllocID)
-		if err != nil {
-			// Allocation doesn't exist in Nomad, clean it up
-			log.Printf("Cleaning up stale allocation %s (IP: %s)", record.AllocID, record.IP)
-
-			// Stop Nebula instance if running
-			_ = a.nebulaManager.StopInstance(record.AllocID)
-
-			// Release IP
-			if err := a.consulManager.ReleaseIP(record.IP); err != nil {
-				log.Printf("Warning: failed to release IP %s: %v", record.IP, err)
-			}
-
-			// Delete allocation record
-			if err := a.consulManager.DeleteAllocationRecord(record.AllocID); err != nil {
-				log.Printf("Warning: failed to delete allocation record %s: %v", record.AllocID, err)
-			} else {
-				cleaned++
+	recordIPs := make(map[string]bool)
+	if len(records) > 0 {
+		a.logger.Debugf("Checking %d allocation records for dangling tasks...", len(records))
+		for _, record := range records {
+			recordIPs[record.IP] = true
+			// Check if allocation still exists in Nomad
+			_, err := a.nomadClient.GetTaskMetadata(record.AllocID)
+			if err != nil {
+				a.logger.Infof("Cleaning up dangling allocation %s (IP: %s)", record.AllocID, record.IP)
+				_ = a.nebulaManager.StopInstance(record.AllocID)
+				_ = a.consulManager.ReleaseIP(record.IP)
+				_ = a.consulManager.DeleteAllocationRecord(record.AllocID)
 			}
 		}
 	}
 
-	if cleaned > 0 {
-		log.Printf("Cleaned up %d stale allocation(s)", cleaned)
-	} else {
-		log.Printf("All allocations are still active")
+	// 2. Clean up orphaned IPs (Pool says allocated, but no Consul record exists)
+	pool, err := a.consulManager.GetIPPool()
+	if err != nil {
+		return fmt.Errorf("failed to get IP pool: %w", err)
 	}
 
+	orphanedCount := 0
+	for _, ip := range pool.Allocated {
+		if !recordIPs[ip] {
+			a.logger.Infof("Reclaiming orphaned IP %s (leaked in pool)", ip)
+			if err := a.consulManager.ReleaseIP(ip); err != nil {
+				a.logger.Warnf("failed to release orphaned IP %s: %v", ip, err)
+			} else {
+				orphanedCount++
+			}
+		}
+	}
+
+	if orphanedCount > 0 {
+		a.logger.Infof("Successfully reclaimed %d orphaned IP(s)", orphanedCount)
+	}
+
+	a.logger.Debug("Cleanup check complete")
 	return nil
 }
 
-// waitForNomad waits for Nomad to be available with a timeout.
-func (a *Agent) waitForNomad(timeout time.Duration) error {
-	log.Printf("Waiting for Nomad to be available (timeout: %v)...", timeout)
+// startCleanupWorker starts a background goroutine that periodically
+// cleans up stale allocations and leaked IPs.
+func (a *Agent) startCleanupWorker() {
+	go func() {
+		// Run every 1 hour
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
 
-	deadline := time.Now().Add(timeout)
-	attempt := 1
-
-	for time.Now().Before(deadline) {
-		// Try to list nodes as a health check
-		_, _, err := a.nomadClient.client.Nodes().List(nil)
-		if err == nil {
-			log.Printf("Nomad is available")
-			return nil
+		for range ticker.C {
+			if err := a.cleanupStaleAllocations(); err != nil {
+				a.logger.Errorf("Periodic cleanup error: %v", err)
+			}
 		}
-
-		if attempt == 1 {
-			log.Printf("Nomad not available yet (attempt %d): %v", attempt, err)
-		} else if attempt%5 == 0 {
-			log.Printf("Still waiting for Nomad (attempt %d): %v", attempt, err)
-		}
-
-		attempt++
-		time.Sleep(1 * time.Second)
-	}
-
-	return fmt.Errorf("timeout waiting for Nomad after %v", timeout)
+	}()
 }
 
 // getLocalNodeID attempts to determine the local Nomad node ID by matching IP addresses.
@@ -434,7 +421,7 @@ func (a *Agent) getLocalNodeID() (string, error) {
 		// Get full node info to access addresses
 		nodeAddr := node.Address
 		if localIPs[nodeAddr] {
-			log.Printf("Matched local node by IP address: %s (node ID: %s)", nodeAddr, node.ID)
+			a.logger.Infof("Matched local node by IP address: %s (node ID: %s)", nodeAddr, node.ID)
 			return node.ID, nil
 		}
 	}
@@ -497,7 +484,7 @@ func (a *Agent) getLocalAllocations() ([]*client.AllocationRecord, error) {
 	var nomadAllocIDs map[string]bool
 	allocIDs, err := a.nomadClient.GetNodeAllocations(localNodeId)
 	if err != nil {
-		log.Printf("Warning: failed to get node allocations from Nomad: %v", err)
+		a.logger.Warnf("failed to get node allocations from Nomad: %v", err)
 		// Fall back to hostname filtering only
 	} else {
 		nomadAllocIDs = make(map[string]bool)
@@ -516,7 +503,7 @@ func (a *Agent) getLocalAllocations() ([]*client.AllocationRecord, error) {
 		// If we have Nomad data, also verify allocation is running on this node
 		if nomadAllocIDs != nil {
 			if !nomadAllocIDs[record.AllocID] {
-				log.Printf("Allocation %s in Consul but not running on this node (skipping)", record.AllocID)
+				a.logger.Debugf("Allocation %s in Consul but not running on this node (skipping)", record.AllocID)
 				continue
 			}
 		}
@@ -529,7 +516,7 @@ func (a *Agent) getLocalAllocations() ([]*client.AllocationRecord, error) {
 
 // restartLocalInstances restarts Nebula instances for allocations on this node.
 func (a *Agent) restartLocalInstances() error {
-	log.Printf("Checking for Nebula instances to restart on this node...")
+	a.logger.Debug("Checking for Nebula instances to restart on this node...")
 
 	// Get allocations for this node only
 	records, err := a.getLocalAllocations()
@@ -538,11 +525,11 @@ func (a *Agent) restartLocalInstances() error {
 	}
 
 	if len(records) == 0 {
-		log.Printf("No local allocations found to restart")
+		a.logger.Debug("No local allocations found to restart")
 		return nil
 	}
 
-	log.Printf("Found %d local allocation(s), checking which need restart...", len(records))
+	a.logger.Infof("Found %d local allocation(s), checking which need restart...", len(records))
 
 	restarted := 0
 	skipped := 0
@@ -551,15 +538,14 @@ func (a *Agent) restartLocalInstances() error {
 	for _, record := range records {
 		// Check if already running
 		if _, exists := a.nebulaManager.GetInstance(record.AllocID); exists {
-			log.Printf("Nebula instance for %s already running, skipping", record.AllocID)
+			a.logger.Debugf("Nebula instance for %s already running, skipping", record.AllocID)
 			skipped++
 			continue
 		}
 
 		// Check if network namespace still exists
 		if !namespaceExists(record.NetNS) {
-			log.Printf("Network namespace %s for allocation %s no longer exists, skipping",
-				record.NetNS, record.AllocID)
+			a.logger.Warnf("Network namespace %s for allocation %s no longer exists, skipping", record.NetNS, record.AllocID)
 			skipped++
 			continue
 		}
@@ -567,7 +553,7 @@ func (a *Agent) restartLocalInstances() error {
 		// Get task metadata from Nomad for config
 		metadata, err := a.nomadClient.GetTaskMetadata(record.AllocID)
 		if err != nil {
-			log.Printf("Failed to get metadata for %s: %v (allocation may be gone)", record.AllocID, err)
+			a.logger.Warnf("Failed to get metadata for %s: %v (allocation may be gone)", record.AllocID, err)
 			skipped++
 			continue
 		}
@@ -575,7 +561,7 @@ func (a *Agent) restartLocalInstances() error {
 		// Get CA cert
 		caCertPEM, err := a.certSigner.GetCACertificate()
 		if err != nil {
-			log.Printf("Failed to get CA cert for %s: %v", record.AllocID, err)
+			a.logger.Errorf("Failed to get CA cert for %s: %v", record.AllocID, err)
 			failed++
 			continue
 		}
@@ -585,7 +571,7 @@ func (a *Agent) restartLocalInstances() error {
 		certPEM, keyPEM, err := a.certSigner.SignCertificate(
 			record.IP, metadata.Roles, certName, a.config.CertTTL)
 		if err != nil {
-			log.Printf("Failed to sign certificate for %s: %v", record.AllocID, err)
+			a.logger.Errorf("Failed to sign certificate for %s: %v", record.AllocID, err)
 			failed++
 			continue
 		}
@@ -602,16 +588,16 @@ func (a *Agent) restartLocalInstances() error {
 		)
 
 		if err != nil {
-			log.Printf("Failed to restart Nebula for %s: %v", record.AllocID, err)
+			a.logger.Errorf("Failed to restart Nebula for %s: %v", record.AllocID, err)
 			failed++
 			continue
 		}
 
 		restarted++
-		log.Printf("Restarted Nebula instance for allocation %s (IP: %s)", record.AllocID, record.IP)
+		a.logger.Infof("Restarted Nebula instance for allocation %s (IP: %s)", record.AllocID, record.IP)
 	}
 
-	log.Printf("Restart summary: %d restarted, %d skipped, %d failed", restarted, skipped, failed)
+	a.logger.Infof("Restart summary: %d restarted, %d skipped, %d failed", restarted, skipped, failed)
 
 	if failed > 0 {
 		return fmt.Errorf("%d instances failed to restart", failed)
@@ -634,11 +620,11 @@ func (a *Agent) startCertRotationWorker() {
 		ticker := time.NewTicker(a.config.CertTTL / 5)
 		defer ticker.Stop()
 
-		log.Printf("Certificate rotation worker started (checking every %v)", a.config.CertTTL/5)
+		a.logger.Infof("Certificate rotation worker started (checking every %v)", a.config.CertTTL/5)
 
 		for range ticker.C {
 			if err := a.rotateCertificates(); err != nil {
-				log.Printf("Certificate rotation error: %v", err)
+				a.logger.Errorf("Certificate rotation error: %v", err)
 			}
 		}
 	}()
@@ -647,7 +633,7 @@ func (a *Agent) startCertRotationWorker() {
 // rotateCertificates checks all local allocations and rotates certificates
 // that are close to expiry (< 25% TTL remaining).
 func (a *Agent) rotateCertificates() error {
-	log.Printf("Running certificate rotation check...")
+	a.logger.Debug("Running certificate rotation check...")
 
 	// Get local allocations only
 	records, err := a.getLocalAllocations()
@@ -656,7 +642,7 @@ func (a *Agent) rotateCertificates() error {
 	}
 
 	if len(records) == 0 {
-		log.Printf("No local allocations to check for rotation")
+		a.logger.Debug("No local allocations to check for rotation")
 		return nil
 	}
 
@@ -668,7 +654,7 @@ func (a *Agent) rotateCertificates() error {
 		// Read certificate from running instance's config
 		nebulaCert, err := a.nebulaManager.GetCertFromConfig(record.AllocID)
 		if err != nil {
-			log.Printf("Failed to read cert for %s: %v, skipping rotation", record.AllocID, err)
+			a.logger.Warnf("Failed to read cert for %s: %v, skipping rotation", record.AllocID, err)
 			skipped++
 			continue
 		}
@@ -683,10 +669,10 @@ func (a *Agent) rotateCertificates() error {
 			continue
 		}
 
-		log.Printf("Rotating certificate for %s (expires in %v)", record.AllocID, timeRemaining)
+		a.logger.Infof("Rotating certificate for %s (expires in %v)", record.AllocID, timeRemaining)
 
 		if err := a.rotateSingleCert(record); err != nil {
-			log.Printf("Failed to rotate cert for %s: %v", record.AllocID, err)
+			a.logger.Errorf("Failed to rotate cert for %s: %v", record.AllocID, err)
 			failed++
 			continue
 		}
@@ -694,7 +680,7 @@ func (a *Agent) rotateCertificates() error {
 		rotated++
 	}
 
-	log.Printf("Rotation summary: %d rotated, %d skipped, %d failed", rotated, skipped, failed)
+	a.logger.Infof("Rotation summary: %d rotated, %d skipped, %d failed", rotated, skipped, failed)
 
 	if failed > 0 {
 		return fmt.Errorf("%d certificates failed to rotate", failed)
@@ -746,7 +732,7 @@ func (a *Agent) rotateSingleCert(record *client.AllocationRecord) error {
 	}
 
 	newExpiry := time.Now().Add(a.config.CertTTL)
-	log.Printf("Successfully rotated certificate for %s (new expiry: %v)", record.AllocID, newExpiry)
+	a.logger.Infof("Successfully rotated certificate for %s (new expiry: %v)", record.AllocID, newExpiry)
 
 	return nil
 }

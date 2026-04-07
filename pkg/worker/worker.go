@@ -30,7 +30,7 @@ type Worker struct {
 // New creates a new worker instance.
 func New(allocID, socketPath, configString string) (*Worker, error) {
 	logger := logrus.New()
-	logger.SetLevel(logrus.InfoLevel)
+	logger.SetLevel(logrus.WarnLevel)
 	logger.SetFormatter(&logrus.TextFormatter{
 		FullTimestamp: true,
 	})
