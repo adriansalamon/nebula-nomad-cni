@@ -4,47 +4,50 @@ A CNI plugin and agent service that provides [nebula](https://github.com/slackhq
 
 ## Overview
 
-- Automatic IP allocation for nomad jobs
-- Certificate issuing, signing, and rotation
-- Distributed state management via Consul
+- **Automatic IP allocation** for Nomad jobs via Consul.
+- **Certificate management**: Automatic issuing, signing, and **zero-downtime rotation**.
+- **Distributed state**: Consul manages IP pools and allocation records across the cluster.
+- **Process Isolation**: Each Nebula instance runs in a separate worker process within the task's network namespace.
 
 ## Architecture
 
 ### Components
 
-1. **nebula-nomad-agent** - Long-lived systemd service running on all Nomad clients
-   - Manages IP allocation via Consul
-   - Signs Nebula certificates
-   - Runs Nebula instances as in-process goroutines (using Nebula as a Go library)
-   - Exposes API via Unix socket
-
-2. **nebula-nomad-cni** - CNI plugin binary called by Nomad
-   - Communicates with agent via Unix socket
-   - Returns quickly to Nomad
-
-3. **Consul** - Distributed state storage
-   - IP pool management
-   - Allocation records
+1.  **nebula-nomad-agent** - Long-lived systemd service running on each Nomad client.
+    - Manages IP allocation and certificate signing.
+    - Orchestrates **nebula-nomad-worker** processes using systemd transient units.
+    - Handles certificate rotation by pushing new configs to workers via Unix sockets.
+2.  **nebula-nomad-worker** - Short-lived process managed by the agent.
+    - Runs the actual Nebula instance for a single Nomad allocation.
+    - Communicates with the agent for configuration reloads.
+3.  **nebula-nomad-cni** - CNI plugin binary called by Nomad.
+    - Communicates with the agent via Unix socket to request networking for new allocations.
+4.  **Consul** - Distributed state store.
+    - Stores IP pool configuration and active allocation records.
 
 ## Configuration
 
 ### Prerequisites
 
-1. **Nebula CA Certificate** - Currently, all agents must share the same CA certificate.
-2. **Consul** - Running and accessible from Nomad clients
-3. **Config file** - See [config.toml.example](config.toml.example) for an example.
-4. **Create Systemd Service** (`/etc/systemd/system/nebula-nomad-agent.service`)
+1.  **Nebula CA Certificate** - All agents must share the same CA certificate.
+2.  **Consul** - Cluster-wide storage for IP pools.
+3.  **Config file** - Create `/etc/nebula-cni/agent.toml`. See [config.toml.example](config.toml.example).
+4.  **Install Binaries** - Place `nebula-nomad-agent`, `nebula-nomad-worker`, and `nebula-nomad-cni` in appropriate paths (e.g., `/usr/local/bin/` and `/opt/cni/bin/`).
+
+### Agent Setup
+
+Create the systemd service for the agent (`/etc/systemd/system/nebula-nomad-agent.service`):
 
 ```ini
 [Unit]
 Description=Nebula Nomad Agent
-After=network.target consul.service
+After=network.target consul.service nomad.service
 
 [Service]
 Type=simple
-ExecStart=/path/to/nebula-nomad-agent -config /path/to/config.toml
+ExecStart=/usr/local/bin/nebula-nomad-agent -config /etc/nebula-cni/agent.toml
 Restart=always
-RestartSec=10
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
@@ -54,8 +57,8 @@ note: You could probably run this in other ways, e.g. as a nomad system job.
 
 ### CNI Plugin Setup
 
-1. **Install CNI Binary** - Put binary in `/opt/cni/bin/`
-2. **Create CNI Configuration** (`/opt/cni/config/nebula.conflist`)
+1.  **Install CNI Binary** - Place `nebula-nomad-cni` in `/opt/cni/bin/`.
+2.  **Create CNI Configuration** (`/opt/cni/config/nebula.conflist`):
 
    ```json
    {
@@ -93,6 +96,25 @@ note: You could probably run this in other ways, e.g. as a nomad system job.
      ]
    }
    ```
+
+#### Advanced CNI Options
+
+You can also delegate to the `macvlan` plugin to provide an additional interface (e.g., for public IP access via DHCP):
+
+```json
+{
+  "type": "nebula-nomad-cni",
+  "socket_path": "/var/run/nebula-cni.sock",
+  "macvlan": {
+    "enable": true,
+    "master": "eth0",
+    "name": "public0",
+    "ipam": {
+      "type": "dhcp"
+    }
+  }
+}
+```
 
 3. **Configure Nomad Client** (`/etc/nomad.d/client.hcl`)
 
@@ -157,6 +179,29 @@ job "web-app" {
   }
 }
 ```
+
+## Detailed Usage
+
+### Task Metadata
+
+The `nebula-nomad-agent` extracts configuration from the Nomad job metadata:
+
+-   `nebula_roles`: A JSON-encoded list of roles/groups to assign to the Nebula certificate.
+-   `nebula_config`: A JSON-encoded object of Nebula configuration overrides (e.g., firewall rules).
+
+### Certificate Rotation
+
+The agent automatically handles certificate rotation before they expire.
+1. It periodially checks active allocations.
+2. If less than 25% of the certificate's TTL remains, it signs a new certificate.
+3. It pushes the new configuration to the `nebula-nomad-worker` process via its Unix socket.
+4. The worker reloads the configuration in-process, providing **zero-downtime rotation**.
+
+### State Management & Recovery
+
+-   **Consul** is the source of truth for IP allocations.
+-   On startup, the agent checks Nomad for running allocations and restarts any missing `nebula-nomad-worker` processes.
+-   Stale allocation records in Consul are automaticallly cleaned up if the corresponding Nomad task no longer exists.
 
 ## References
 

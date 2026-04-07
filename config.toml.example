@@ -21,6 +21,9 @@ nebula_config_path = "/path/to/nebula-config.yaml"
 # Certificate TTL (duration format: 1h, 24h, etc.)
 cert_ttl = "1h"
 
+# Path to nebula-nomad-worker binary
+worker_binary_path = "/usr/local/bin/nebula-nomad-worker"
+
 # IP Pool configuration for Nomad allocations
 [ip_pool]
 # Full Nebula network CIDR
