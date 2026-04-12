@@ -10,6 +10,10 @@ import (
 
 	"github.com/sirupsen/logrus"
 
+	"github.com/containernetworking/plugins/pkg/ns"
+	"github.com/google/nftables"
+	"github.com/google/nftables/expr"
+
 	"github.com/containernetworking/cni/pkg/invoke"
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
@@ -23,10 +27,11 @@ import (
 
 // MacVLANConfig holds optional macvlan delegation configuration
 type MacVLANConfig struct {
-	Enable bool           `json:"enable"`
-	Master string         `json:"master"`
-	Name   string         `json:"name"`
-	IPAM   map[string]any `json:"ipam"`
+	Enable   bool           `json:"enable"`
+	Master   string         `json:"master"`
+	Name     string         `json:"name"`
+	Firewall bool           `json:"firewall"`
+	IPAM     map[string]any `json:"ipam"`
 }
 
 // NetConf is the CNI network configuration.
@@ -101,6 +106,48 @@ func cmdAdd(args *skel.CmdArgs) error {
 		return fmt.Errorf("missing required fields: alloc_id=%s netns=%s", allocID, args.Netns)
 	}
 
+	// Build result: preserve previous plugin results if chained, or create new result
+	var result *current.Result
+	if conf.PrevResult != nil {
+		// Chained mode: preserve all previous result data
+		result = conf.PrevResult
+	} else {
+		// Standalone mode: return new result
+		result = &current.Result{
+			CNIVersion: conf.CNIVersion,
+			IPs:        []*current.IPConfig{},
+		}
+	}
+
+	// Delegate to macvlan plugin if configured
+	if conf.MacVLAN != nil && conf.MacVLAN.Enable {
+		macvlanResult, err := delegateMacvlan(args, conf)
+		if err != nil {
+			return fmt.Errorf("failed to delegate to macvlan: %w", err)
+		}
+
+		// Merge macvlan result with our result
+		result.Interfaces = append(result.Interfaces, macvlanResult.Interfaces...)
+		result.IPs = append(result.IPs, macvlanResult.IPs...)
+		result.Routes = append(result.Routes, macvlanResult.Routes...)
+
+		// Get the network namespace and applying firewall rules specifically for the macvlan interface
+		if conf.MacVLAN.Firewall {
+			netNS, err := ns.GetNS(args.Netns)
+			if err != nil {
+				return fmt.Errorf("failed to open netns %q: %w", args.Netns, err)
+			}
+
+			if err := netNS.Do(func(_ ns.NetNS) error {
+				return applyFirewall(conf.MacVLAN.Name)
+			}); err != nil {
+				netNS.Close()
+				return fmt.Errorf("failed to apply firewall: %w", err)
+			}
+			netNS.Close()
+		}
+	}
+
 	// Create client
 	c := client.NewClient(conf.SocketPath)
 
@@ -128,34 +175,8 @@ func cmdAdd(args *skel.CmdArgs) error {
 		Gateway: nil, // Nebula handles routing, no gateway needed
 	}
 
-	// Build result: preserve previous plugin results if chained, or create new result
-	var result *current.Result
-	if conf.PrevResult != nil {
-		// Chained mode: prepend Nebula IP so it's the primary address
-		// Preserve all previous result data (interfaces, routes, DNS, etc.)
-		result = conf.PrevResult
-		result.IPs = append([]*current.IPConfig{nebulaIP}, result.IPs...)
-	} else {
-		// Standalone mode: return only Nebula IP
-		result = &current.Result{
-			CNIVersion: conf.CNIVersion,
-			IPs:        []*current.IPConfig{nebulaIP},
-		}
-	}
-
-	// Delegate to macvlan plugin if configured
-	if conf.MacVLAN != nil && conf.MacVLAN.Enable {
-
-		macvlanResult, err := delegateMacvlan(args, conf)
-		if err != nil {
-			return fmt.Errorf("failed to delegate to macvlan: %w", err)
-		}
-
-		// Merge macvlan result with our result
-		result.Interfaces = append(result.Interfaces, macvlanResult.Interfaces...)
-		result.IPs = append(result.IPs, macvlanResult.IPs...)
-		result.Routes = append(result.Routes, macvlanResult.Routes...)
-	}
+	// Prefix Nebula IP
+	result.IPs = append([]*current.IPConfig{nebulaIP}, result.IPs...)
 
 	// Return combined result
 	return types.PrintResult(result, conf.CNIVersion)
@@ -352,4 +373,98 @@ func mustParseCIDR(ipStr string) net.IPNet {
 		IP:   ip,
 		Mask: ipNet.Mask,
 	}
+}
+
+func applyFirewall(macvlanIfName string) error {
+	c, err := nftables.New()
+	if err != nil {
+		return fmt.Errorf("failed to init nftables netlink: %w", err)
+	}
+
+	// Create table cni_filter
+	tb := c.AddTable(&nftables.Table{
+		Family: nftables.TableFamilyINet,
+		Name:   "cni_filter",
+	})
+
+	// Create input chain
+	policyAccept := nftables.ChainPolicyAccept
+	ch := c.AddChain(&nftables.Chain{
+		Name:     "input",
+		Table:    tb,
+		Type:     nftables.ChainTypeFilter,
+		Hooknum:  nftables.ChainHookInput,
+		Priority: nftables.ChainPriorityFilter,
+		Policy:   &policyAccept,
+	})
+
+	macvlanBytes := make([]byte, 16)
+	copy(macvlanBytes, macvlanIfName)
+
+	// Rule 1: Accept return traffic for outbound connections on the macvlan interface
+	// iifname "$macvlanIfName" ct state established,related accept
+	c.AddRule(&nftables.Rule{
+		Table: tb,
+		Chain: ch,
+		Exprs: []expr.Any{
+			// Match iifname == macvlanIfName
+			&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
+			&expr.Cmp{
+				Op:       expr.CmpOpEq,
+				Register: 1,
+				Data:     macvlanBytes,
+			},
+			// Load ct state -> register 1
+			&expr.Ct{
+				Register:       1,
+				SourceRegister: false,
+				Key:            expr.CtKeySTATE,
+			},
+			// Bitwise AND with 0x06 (ESTABLISHED | RELATED)
+			&expr.Bitwise{
+				SourceRegister: 1,
+				DestRegister:   1,
+				Len:            4,
+				Mask:           []byte{0x06, 0x00, 0x00, 0x00},
+				Xor:            []byte{0x00, 0x00, 0x00, 0x00},
+			},
+			// Check if != 0
+			&expr.Cmp{
+				Op:       expr.CmpOpNeq,
+				Register: 1,
+				Data:     []byte{0x00, 0x00, 0x00, 0x00},
+			},
+			// Verdict: ACCEPT
+			&expr.Verdict{
+				Kind: expr.VerdictAccept,
+			},
+		},
+	})
+
+	// Rule 2: Drop all other unsolicited inbound traffic from the macvlan interface
+	// iifname "$macvlanIfName" drop
+	c.AddRule(&nftables.Rule{
+		Table: tb,
+		Chain: ch,
+		Exprs: []expr.Any{
+			// Match iifname == macvlanIfName
+			&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
+			&expr.Cmp{
+				Op:       expr.CmpOpEq,
+				Register: 1,
+				Data:     macvlanBytes,
+			},
+			// Verdict: DROP
+			&expr.Verdict{
+				Kind: expr.VerdictDrop,
+			},
+		},
+	})
+
+	// Execute transaction
+	if err := c.Flush(); err != nil {
+		return fmt.Errorf("nftables flush failed: %w", err)
+	}
+
+	return nil
 }

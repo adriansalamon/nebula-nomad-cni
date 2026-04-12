@@ -121,7 +121,7 @@ The agent and CNI plugin both support structured, leveled logging via `logrus`. 
 
 #### Advanced CNI Options
 
-You can also delegate to the `macvlan` plugin to provide an additional interface (e.g., for public IP access via DHCP):
+You can also delegate to the `macvlan` plugin to provide an additional interface (e.g., for public IP access via DHCP). I've found that nebula doesn't play nicely with double NAT, so this is a good way to provide a public interface.
 
 ```json
 {
@@ -131,12 +131,15 @@ You can also delegate to the `macvlan` plugin to provide an additional interface
     "enable": true,
     "master": "eth0",
     "name": "public0",
+    "firewall": true,
     "ipam": {
       "type": "dhcp"
     }
   }
 }
 ```
+
+Setting `"firewall": true` automatically applies `nftables` isolation rules inside the container's network namespace immediately after provisioning. This securely locks down the MACVLAN interface to drop any untracked or unsolicited inbound traffic.
 
 3. **Configure Nomad Client** (`/etc/nomad.d/client.hcl`)
 

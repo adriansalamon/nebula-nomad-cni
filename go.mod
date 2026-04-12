@@ -8,6 +8,7 @@ require (
 	github.com/containernetworking/cni v1.3.0
 	github.com/coreos/go-systemd/v22 v22.7.0
 	github.com/godbus/dbus/v5 v5.1.0
+	github.com/google/nftables v0.3.0
 	github.com/gorilla/mux v1.8.1
 	github.com/hashicorp/consul/api v1.33.4
 	github.com/hashicorp/nomad/api v0.0.0-20260312153230-b4cbc3732304
@@ -20,6 +21,12 @@ require (
 )
 
 require (
+	github.com/google/go-cmp v0.7.0 // indirect
+	github.com/mdlayher/netlink v1.7.3-0.20250113171957-fbb4dce95f42 // indirect
+	github.com/mdlayher/socket v0.5.1 // indirect
+)
+
+require (
 	filippo.io/bigmod v0.1.0 // indirect
 	github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be // indirect
 	github.com/armon/go-metrics v0.4.1 // indirect
@@ -27,6 +34,7 @@ require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/containernetworking/plugins v1.9.1
 	github.com/cyberdelia/go-metrics-graphite v0.0.0-20161219230853-39f87cc3b432 // indirect
 	github.com/fatih/color v1.18.0 // indirect
 	github.com/flynn/noise v1.1.0 // indirect
