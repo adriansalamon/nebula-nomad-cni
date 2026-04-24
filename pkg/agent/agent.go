@@ -97,8 +97,8 @@ func (a *Agent) Start() error {
 		return fmt.Errorf("failed to create unix socket: %w", err)
 	}
 
-	// Set socket permissions
-	if err := os.Chmod(a.config.SocketPath, 0777); err != nil {
+	// Restrict to root only — only the CNI plugin (invoked by Nomad as root) connects here.
+	if err := os.Chmod(a.config.SocketPath, 0600); err != nil {
 		listener.Close()
 		return fmt.Errorf("failed to set socket permissions: %w", err)
 	}

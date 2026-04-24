@@ -175,8 +175,8 @@ func (w *Worker) startSocketServer() error {
 		return fmt.Errorf("failed to create socket: %w", err)
 	}
 
-	// Set permissions so agent can connect
-	if err := os.Chmod(w.socketPath, 0666); err != nil {
+	// Restrict to root only — only the agent (root) connects here.
+	if err := os.Chmod(w.socketPath, 0600); err != nil {
 		listener.Close()
 		return fmt.Errorf("failed to set socket permissions: %w", err)
 	}
