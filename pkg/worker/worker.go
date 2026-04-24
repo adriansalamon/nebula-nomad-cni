@@ -7,9 +7,11 @@ import (
 	"net"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/sirupsen/logrus"
 	"github.com/slackhq/nebula"
+	"github.com/slackhq/nebula/cert"
 	"github.com/slackhq/nebula/config"
 	"go.yaml.in/yaml/v2"
 )
@@ -70,10 +72,76 @@ func (w *Worker) Run() error {
 
 	w.logger.Infof("Worker running for allocation %s (socket: %s)", w.allocID, w.socketPath)
 
+	go w.watchCertExpiry()
+
 	// Wait for shutdown
 	w.wg.Wait()
 
 	return nil
+}
+
+// getCertExpiry returns the expiry of the certificate in the current Nebula config.
+// reloadConfig updates nebulaConfig in place, so this always reflects the live cert.
+func (w *Worker) getCertExpiry() (time.Time, error) {
+	pkiRaw, ok := w.nebulaConfig.Settings["pki"]
+	if !ok {
+		return time.Time{}, fmt.Errorf("no pki section in config")
+	}
+
+	// Extract pki["cert"] — nebula may use either map type depending on yaml library version.
+	var certRaw interface{}
+	switch pki := pkiRaw.(type) {
+	case map[string]interface{}:
+		certRaw = pki["cert"]
+	case map[interface{}]interface{}:
+		certRaw = pki["cert"]
+	default:
+		return time.Time{}, fmt.Errorf("unexpected pki type %T", pkiRaw)
+	}
+
+	certPEM, ok := certRaw.(string)
+	if !ok || certPEM == "" {
+		return time.Time{}, fmt.Errorf("pki.cert missing or not a string")
+	}
+
+	nebulaCert, _, err := cert.UnmarshalCertificateFromPEM([]byte(certPEM))
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed to parse certificate: %w", err)
+	}
+	return nebulaCert.NotAfter(), nil
+}
+
+// watchCertExpiry shuts the worker down if the certificate expires without renewal.
+// An expired cert means the agent missed several rotation windows — likely orphaned.
+func (w *Worker) watchCertExpiry() {
+	const checkInterval = time.Minute
+	const gracePeriod = 5 * time.Minute
+
+	ticker := time.NewTicker(checkInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-w.ctx.Done():
+			return
+		case <-ticker.C:
+			expiry, err := w.getCertExpiry()
+			if err != nil {
+				w.logger.Warnf("Could not read cert expiry: %v", err)
+				continue
+			}
+
+			if time.Now().After(expiry.Add(gracePeriod)) {
+				w.logger.Warnf(
+					"Certificate expired at %v (%v ago) and was not renewed — assuming orphaned worker, shutting down",
+					expiry.Format(time.RFC3339),
+					time.Since(expiry).Round(time.Second),
+				)
+				w.shutdown()
+				return
+			}
+		}
+	}
 }
 
 // startNebula initializes and starts the Nebula instance.

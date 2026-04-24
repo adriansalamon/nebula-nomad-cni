@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/sirupsen/logrus"
@@ -276,6 +277,65 @@ func dbusProperty(name string, v any) dbus.Property {
 		Name:  name,
 		Value: godbus.MakeVariant(v),
 	}
+}
+
+// StopOrphanedUnits stops any running nebula-nomad-worker units whose allocID
+// is absent from knownAllocIDs (i.e. no Consul record and no live Nomad task).
+func (nm *NebulaManager) StopOrphanedUnits(knownAllocIDs map[string]bool) error {
+	conn, err := nm.getSystemdConnection()
+	if err != nil {
+		return fmt.Errorf("failed to connect to systemd: %w", err)
+	}
+
+	units, err := conn.ListUnitsByPatternsContext(context.TODO(),
+		[]string{"active", "activating", "deactivating"},
+		[]string{"nebula-nomad-worker@*.service"},
+	)
+	if err != nil {
+		return fmt.Errorf("failed to list systemd units: %w", err)
+	}
+
+	stopped := 0
+	for _, unit := range units {
+		allocID := extractAllocIDFromUnit(unit.Name)
+		if allocID == "" {
+			continue
+		}
+
+		if knownAllocIDs[allocID] {
+			continue
+		}
+
+		nm.logger.Infof("Stopping orphaned unit %s (no Consul record and not running in Nomad)", unit.Name)
+		if err := nm.stopExistingUnit(conn, unit.Name); err != nil {
+			nm.logger.Warnf("Failed to stop orphaned unit %s: %v", unit.Name, err)
+			continue
+		}
+
+		_ = os.RemoveAll(worker.GetSocketPath(allocID))
+
+		nm.instancesLock.Lock()
+		delete(nm.instances, allocID)
+		nm.instancesLock.Unlock()
+
+		stopped++
+	}
+
+	if stopped > 0 {
+		nm.logger.Infof("Stopped %d orphaned nebula-nomad-worker unit(s)", stopped)
+	}
+
+	return nil
+}
+
+// extractAllocIDFromUnit extracts the allocID from "nebula-nomad-worker@<allocID>.service".
+func extractAllocIDFromUnit(unitName string) string {
+	const prefix = "nebula-nomad-worker@"
+	const suffix = ".service"
+	if !strings.HasPrefix(unitName, prefix) || !strings.HasSuffix(unitName, suffix) {
+		return ""
+	}
+	return unitName[len(prefix) : len(unitName)-len(suffix)]
 }
 
 // GenerateConfigString is a public wrapper for generateInstanceConfigString.

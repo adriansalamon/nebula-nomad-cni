@@ -345,6 +345,7 @@ func (a *Agent) cleanupStaleAllocations() error {
 	}
 
 	recordIPs := make(map[string]bool)
+	cleanedAllocIDs := make(map[string]bool)
 	if len(records) > 0 {
 		a.logger.Debugf("Checking %d allocation records for dangling tasks...", len(records))
 		for _, record := range records {
@@ -356,6 +357,7 @@ func (a *Agent) cleanupStaleAllocations() error {
 				_ = a.nebulaManager.StopInstance(record.AllocID)
 				_ = a.consulManager.ReleaseIP(record.IP)
 				_ = a.consulManager.DeleteAllocationRecord(record.AllocID)
+				cleanedAllocIDs[record.AllocID] = true
 			}
 		}
 	}
@@ -380,6 +382,17 @@ func (a *Agent) cleanupStaleAllocations() error {
 
 	if orphanedCount > 0 {
 		a.logger.Infof("Successfully reclaimed %d orphaned IP(s)", orphanedCount)
+	}
+
+	// 3. Stop systemd units with no backing Consul record or Nomad allocation.
+	knownAllocIDs := make(map[string]bool)
+	for _, record := range records {
+		if !cleanedAllocIDs[record.AllocID] {
+			knownAllocIDs[record.AllocID] = true
+		}
+	}
+	if err := a.nebulaManager.StopOrphanedUnits(knownAllocIDs); err != nil {
+		a.logger.Warnf("Failed to stop orphaned units: %v", err)
 	}
 
 	a.logger.Debug("Cleanup check complete")
